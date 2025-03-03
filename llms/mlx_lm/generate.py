@@ -20,6 +20,11 @@ DEFAULT_SEED = 0
 DEFAULT_MODEL = "mlx-community/Llama-3.2-3B-Instruct-4bit"
 DEFAULT_QUANTIZED_KV_START = 5000
 
+# Diffusion model specific parameters
+DEFAULT_STEPS = 32
+DEFAULT_GEN_LENGTH = 64
+DEFAULT_NOISE_TEMPERATURE = 0.0
+DEFAULT_CFG_SCALE = 0.0
 
 def str2bool(string):
     return string.lower() not in ["false", "f"]
@@ -143,6 +148,30 @@ def setup_arg_parser():
         help="Number of tokens to draft when using speculative decoding.",
         default=2,
     )
+    parser.add_argument(
+        "--steps",
+        type=int,
+        default=DEFAULT_STEPS,
+        help="Number of diffusion steps (default: 32)",
+    )
+    parser.add_argument(
+        "--gen-length",
+        type=int,
+        default=DEFAULT_GEN_LENGTH,
+        help="Length of generated sequence (default: 64)",
+    )
+    parser.add_argument(
+        "--noise-temperature",
+        type=float,
+        default=DEFAULT_NOISE_TEMPERATURE,
+        help="Temperature for Gumbel noise in diffusion sampling (default: 0.0)",
+    )
+    parser.add_argument(
+        "--cfg-scale",
+        type=float,
+        default=DEFAULT_CFG_SCALE,
+        help="Classifier-free guidance scale (default: 0.0)",
+    )
     return parser
 
 
@@ -233,22 +262,47 @@ def main():
             raise ValueError("Draft model tokenizer does not match model tokenizer.")
     else:
         draft_model = None
-    sampler = make_sampler(args.temp, args.top_p, args.min_p, args.min_tokens_to_keep)
-    response = generate(
-        model,
-        tokenizer,
-        prompt,
-        max_tokens=args.max_tokens,
-        verbose=args.verbose,
-        sampler=sampler,
-        max_kv_size=args.max_kv_size,
-        prompt_cache=prompt_cache if using_cache else None,
-        kv_bits=args.kv_bits,
-        kv_group_size=args.kv_group_size,
-        quantized_kv_start=args.quantized_kv_start,
-        draft_model=draft_model,
-        num_draft_tokens=args.num_draft_tokens,
-    )
+
+    # Determine model type and generate accordingly
+    model_type = getattr(model.args, "model_type", None)
+    if model_type == "llada":
+        # LLaDA-specific generation
+
+        gen_kwargs = {
+            "steps": args.steps,
+            "gen_length": args.gen_length,
+            "noise_temperature": args.noise_temperature,
+            "cfg_scale": args.cfg_scale,
+        }
+        if using_cache:
+            raise ValueError("Prompt cache is not supported for LLaDA models.")
+        
+        response = generate(
+            model,
+            tokenizer,
+            prompt,
+            verbose=args.verbose,
+             **gen_kwargs
+        )
+    else:
+        # Autoregressive generation
+        sampler = make_sampler(args.temp, args.top_p, args.min_p, args.min_tokens_to_keep)
+        response = generate(
+            model,
+            tokenizer,
+            prompt,
+            max_tokens=args.max_tokens,
+            verbose=args.verbose,
+            sampler=sampler,
+            max_kv_size=args.max_kv_size,
+            prompt_cache=prompt_cache if using_cache else None,
+            kv_bits=args.kv_bits,
+            kv_group_size=args.kv_group_size,
+            quantized_kv_start=args.quantized_kv_start,
+            draft_model=draft_model,
+            num_draft_tokens=args.num_draft_tokens,
+        )
+
     if not args.verbose:
         print(response)
 

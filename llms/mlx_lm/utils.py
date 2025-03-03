@@ -132,6 +132,9 @@ def _get_classes(config: dict):
     model_type = config["model_type"]
     model_type = MODEL_REMAPPING.get(model_type, model_type)
     try:
+        if model_type == "llada":
+            from .models import llada
+            return llada.LLaDAModelLM, llada.ModelArgs
         arch = importlib.import_module(f"mlx_lm.models.{model_type}")
     except ImportError:
         msg = f"Model type {model_type} not supported."
@@ -204,6 +207,116 @@ def maybe_quantize_kv_cache(prompt_cache, quantized_kv_start, kv_group_size, kv_
                 prompt_cache[i] = prompt_cache[i].to_quantized(
                     group_size=kv_group_size, bits=kv_bits
                 )
+
+
+def _add_gumbel_noise(logits: mx.array, noise_temperature: float = 0.0) -> mx.array:
+    """Add Gumbel noise to logits for sampling."""
+    if noise_temperature <= 0.0:
+        return logits
+    u = mx.random.uniform(logits.shape)
+    g = -mx.log(-mx.log(u)) * noise_temperature
+    return logits + g
+
+
+def diffusion_generate(
+    prompt: mx.array,
+    model: nn.Module,
+    tokenizer,
+    *,
+    steps: int = 32,
+    gen_length: int = 64,
+    noise_temperature: float = 0.0,
+    cfg_scale: float = 0.0,
+    remasking: str = "low_confidence",
+    mask_token_id: Optional[int] = None,
+    verbose: bool = False,
+) -> mx.array:
+    """
+    Generate text using diffusion-based progressive unmasking, fully native to MLX.
+
+    Args:
+        prompt (mx.array): Tokenized prompt.
+        model (nn.Module): LLaDA model.
+        tokenizer: Tokenizer instance.
+        steps (int): Number of diffusion steps.
+        gen_length (int): Length of generated sequence.
+        noise_temperature (float): Temperature for noise sampling (unused here).
+        cfg_scale (float): Classifier-free guidance scale (unused here).
+        remasking (str): Remasking strategy ('low_confidence').
+        mask_token_id (int, optional): ID for [MASK] token.
+        verbose (bool): Print debug information.
+
+    Returns:
+        mx.array: Generated token sequence.
+    """
+    mask_token_id = mask_token_id or getattr(model.args, "mask_token_id", 126336)
+    batch_size = 1
+    prompt_length = prompt.shape[0]
+    seq_len = prompt_length + gen_length
+
+    # Initialize sequence with prompt and [MASK] tokens
+    x = mx.full((batch_size, seq_len), mask_token_id, dtype=prompt.dtype)
+    x[:, :prompt_length] = prompt
+
+    # Full-attention mask (zeros allow attention to all positions)
+    mask = mx.zeros((1, 1, seq_len, seq_len), dtype=x.dtype)
+
+    # Diffusion timesteps using MLX linspace
+    timesteps = mx.linspace(1.0, 0.0, steps + 1)[:-1]
+
+    for step, t in enumerate(timesteps):
+        # Compute mask condition and count before update
+        mask_condition = (x == mask_token_id)
+        num_masks = mx.sum(mask_condition).item()
+
+        if num_masks == 0:
+            break
+
+        # Get logits with full attention
+        logits = model(x, mask=mask)
+
+        # Sample predicted tokens
+        probs = mx.softmax(logits, axis=-1)
+        x0 = mx.argmax(probs, axis=-1)
+
+        # Calculate tokens to unmask this step
+        next_t = t - 1.0 / steps if step < steps - 1 else 0
+        current_masks = int(t * gen_length)
+        next_masks = int(next_t * gen_length)
+        tokens_to_unmask = max(1, current_masks - next_masks)  # Ensure at least 1
+
+        if tokens_to_unmask > 0 and num_masks > 0:
+            # Get confidence scores for masked positions
+            confidence_scores = mx.max(probs, axis=-1)
+            masked_confidences = mx.where(mask_condition, confidence_scores, mx.full(confidence_scores.shape, -1e9))
+            flat_confidences = masked_confidences.flatten()
+
+            # Sort confidences descending
+            sorted_indices = mx.argsort(flat_confidences)[::-1]
+            unmask_indices = sorted_indices[:min(tokens_to_unmask, num_masks)]
+
+            # Update only the top-confidence masked positions
+            new_condition = mx.full(x.shape, False, dtype=mx.bool_)
+            for idx in unmask_indices:
+                new_condition = mx.where(mx.arange(seq_len) == idx % seq_len, True, new_condition)
+            x = mx.where(new_condition & mask_condition, x0, x)
+
+        if verbose:
+            # Sampled tokens for display (first 5 where mask was true)
+            sampled_tokens = mx.where(mask_condition, x0, mx.full(x0.shape, -1)).flatten()
+            valid_indices = mx.argsort(sampled_tokens, axis=-1)[::-1]
+            sampled_display = mx.take(sampled_tokens, valid_indices[:min(5, num_masks)]).tolist()
+            current_text = tokenizer.decode(x[0, prompt_length:].tolist(), skip_special_tokens=True)
+            print(f"[DEBUG] Step {step}: Sample predicted tokens for masked positions: {sampled_display}")
+            print(f"[DEBUG] Step {step}: Masks remaining: {mx.sum(x == mask_token_id).item()}")
+            print(f"[DEBUG] Tokens to unmask: {tokens_to_unmask}")
+            print(f"[DEBUG] Current response: {current_text or '...'}")
+
+    if verbose:
+        final_text = tokenizer.decode(x[0, prompt_length:].tolist(), skip_special_tokens=True)
+        print(f"[DEBUG] Final generated text: {final_text}")
+
+    return x
 
 
 def generate_step(
@@ -500,6 +613,7 @@ def stream_generate(
         GenerationResponse: An instance containing the generated text segment and
             associated metadata. See :class:`GenerationResponse` for details.
     """
+    print("[TRACE] Entering stream_generate")  # Temporary trace
     if not isinstance(tokenizer, TokenizerWrapper):
         tokenizer = TokenizerWrapper(tokenizer)
 
@@ -513,28 +627,70 @@ def stream_generate(
         prompt = mx.array(prompt)
 
     detokenizer = tokenizer.detokenizer
+    model_type = getattr(getattr(model, "args", None), "model_type", None)
+    print(f"[TRACE] Model type: {model_type}, Verbose: {kwargs.get('verbose', False)}")  # Check model type and verbose
 
-    if draft_model is None:
-        kwargs.pop("num_draft_tokens", None)
-        token_generator = generate_step(prompt, model, **kwargs)
+    if model_type == "llada":
+        print("[TRACE] Using diffusion_generate for LLaDA")  # Confirm diffusion path
+        diffusion_kwargs = {
+            "steps": kwargs.pop("steps", 64),
+            "gen_length": kwargs.pop("gen_length", 128),
+            "noise_temperature": kwargs.pop("noise_temperature", 0.0),
+            "cfg_scale": kwargs.pop("cfg_scale", 0.0),
+            "remasking": kwargs.pop("remasking", "low_confidence"),
+            "mask_token_id": kwargs.pop("mask_token_id", None),
+            "verbose": kwargs.get("verbose", False),  # Ensure verbose is passed
+        }
+        with wired_limit(model, [generation_stream]):
+            tic = time.perf_counter()
+            output_sequence = diffusion_generate(prompt, model, tokenizer, **diffusion_kwargs)
+            prompt_time = time.perf_counter() - tic
+            prompt_tps = prompt.size / prompt_time
+            generated_tokens = output_sequence[0, prompt.size:]
+            generated_text = tokenizer.decode(generated_tokens.tolist(), skip_special_tokens=True)
+            print(f"[TRACE] Generated tokens: {generated_tokens.tolist()[:10]}, Text: {generated_text}")  # Check output
+            yield GenerationResponse(
+                text=generated_text,
+                token=generated_tokens[-1].item() if generated_tokens.size > 0 else None,
+                logprobs=mx.array([]),
+                prompt_tokens=prompt.size,
+                prompt_tps=prompt_tps,
+                generation_tokens=generated_tokens.size,
+                generation_tps=generated_tokens.size / (time.perf_counter() - tic),
+                peak_memory=mx.metal.get_peak_memory() / 1e9,
+                finish_reason="length",
+            )
     else:
-        kwargs.pop("max_kv_size", None)
-        token_generator = speculative_generate_step(
-            prompt, model, draft_model, **kwargs
-        )
-    with wired_limit(model, [generation_stream]):
-        detokenizer.reset()
-        tic = time.perf_counter()
-        for n, (token, logprobs) in enumerate(token_generator):
-            if n == 0:
-                prompt_time = time.perf_counter() - tic
-                prompt_tps = prompt.size / prompt_time
-                tic = time.perf_counter()
-            if token in tokenizer.eos_token_ids:
-                break
-
-            detokenizer.add_token(token)
-
+        print("[TRACE] Using autoregressive generation")  # Confirm fallback path
+        if draft_model is None:
+            kwargs.pop("num_draft_tokens", None)
+            token_generator = generate_step(prompt, model, **kwargs)
+        else:
+            kwargs.pop("max_kv_size", None)
+            token_generator = speculative_generate_step(prompt, model, draft_model, **kwargs)
+        with wired_limit(model, [generation_stream]):
+            detokenizer.reset()
+            tic = time.perf_counter()
+            for n, (token, logprobs) in enumerate(token_generator):
+                if n == 0:
+                    prompt_time = time.perf_counter() - tic
+                    prompt_tps = prompt.size / prompt_time
+                    tic = time.perf_counter()
+                if token in tokenizer.eos_token_ids:
+                    break
+                detokenizer.add_token(token)
+                yield GenerationResponse(
+                    text=detokenizer.last_segment,
+                    token=token,
+                    logprobs=logprobs,
+                    prompt_tokens=prompt.size,
+                    prompt_tps=prompt_tps,
+                    generation_tokens=n + 1,
+                    generation_tps=(n + 1) / (time.perf_counter() - tic),
+                    peak_memory=mx.metal.get_peak_memory() / 1e9,
+                    finish_reason=None,
+                )
+            detokenizer.finalize()
             yield GenerationResponse(
                 text=detokenizer.last_segment,
                 token=token,
@@ -544,21 +700,8 @@ def stream_generate(
                 generation_tokens=n + 1,
                 generation_tps=(n + 1) / (time.perf_counter() - tic),
                 peak_memory=mx.metal.get_peak_memory() / 1e9,
-                finish_reason=None,
+                finish_reason="stop" if token in tokenizer.eos_token_ids else "length",
             )
-
-        detokenizer.finalize()
-        yield GenerationResponse(
-            text=detokenizer.last_segment,
-            token=token,
-            logprobs=logprobs,
-            prompt_tokens=prompt.size,
-            prompt_tps=prompt_tps,
-            generation_tokens=n + 1,
-            generation_tps=(n + 1) / (time.perf_counter() - tic),
-            peak_memory=mx.metal.get_peak_memory() / 1e9,
-            finish_reason="stop" if token in tokenizer.eos_token_ids else "length",
-        )
 
 
 def generate(
@@ -581,6 +724,7 @@ def generate(
        kwargs: The remaining options get passed to :func:`stream_generate`.
           See :func:`stream_generate` for more details.
     """
+    print(f"[TRACE] Entering generate, Verbose: {verbose}")  # Temporary trace
     if formatter is not None:
         print(
             "[Warning] Text formatting is deprecated and no longer used. "
@@ -590,7 +734,7 @@ def generate(
         print("=" * 10)
 
     text = ""
-    for response in stream_generate(model, tokenizer, prompt, **kwargs):
+    for response in stream_generate(model, tokenizer, prompt, verbose=verbose, **kwargs):
         if verbose:
             print(response.text, end="", flush=True)
         text += response.text
@@ -600,16 +744,16 @@ def generate(
         print("=" * 10)
         if len(text) == 0:
             print("No text generated for this prompt")
-            return
-        print(
-            f"Prompt: {response.prompt_tokens} tokens, "
-            f"{response.prompt_tps:.3f} tokens-per-sec"
-        )
-        print(
-            f"Generation: {response.generation_tokens} tokens, "
-            f"{response.generation_tps:.3f} tokens-per-sec"
-        )
-        print(f"Peak memory: {response.peak_memory:.3f} GB")
+        else:
+            print(
+                f"Prompt: {response.prompt_tokens} tokens, "
+                f"{response.prompt_tps:.3f} tokens-per-sec"
+            )
+            print(
+                f"Generation: {response.generation_tokens} tokens, "
+                f"{response.generation_tps:.3f} tokens-per-sec"
+            )
+            print(f"Peak memory: {response.peak_memory:.3f} GB")
     return text
 
 
@@ -654,11 +798,8 @@ def load_model(
     config.update(model_config)
 
     weight_files = glob.glob(str(model_path / "model*.safetensors"))
-
     if not weight_files:
-        # Try weight for back-compat
         weight_files = glob.glob(str(model_path / "weight*.safetensors"))
-
     if not weight_files:
         logging.error(f"No safetensors found in {model_path}")
         raise FileNotFoundError(f"No safetensors found in {model_path}")
@@ -667,23 +808,22 @@ def load_model(
     for wf in weight_files:
         weights.update(mx.load(wf))
 
-    model_class, model_args_class = get_model_classes(config=config)
 
+    model_class, model_args_class = get_model_classes(config=config)
     model_args = model_args_class.from_dict(config)
     model = model_class(model_args)
+
+    param_dict = model.parameters()
 
     if hasattr(model, "sanitize"):
         weights = model.sanitize(weights)
 
     if (quantization := config.get("quantization", None)) is not None:
-
         def class_predicate(p, m):
-            # Handle custom per layer quantizations
             if p in config["quantization"]:
                 return config["quantization"][p]
             if not hasattr(m, "to_quantized"):
                 return False
-            # Handle legacy models which may not have everything quantized
             return f"{p}.scales" in weights
 
         nn.quantize(
@@ -700,7 +840,6 @@ def load_model(
 
     model.eval()
     return model, config
-
 
 def load(
     path_or_hf_repo: str,
