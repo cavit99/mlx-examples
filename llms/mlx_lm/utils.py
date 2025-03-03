@@ -223,7 +223,7 @@ def diffusion_generate(
     model: nn.Module,
     tokenizer,
     *,
-    steps: int = 32,
+    steps: int = 64,
     gen_length: int = 64,
     noise_temperature: float = 0.0,
     cfg_scale: float = 0.0,
@@ -232,16 +232,16 @@ def diffusion_generate(
     verbose: bool = False,
 ) -> mx.array:
     """
-    Generate text using diffusion-based progressive unmasking, fully native to MLX.
+    Generate text using diffusion-based progressive unmasking and CFG support
 
     Args:
-        prompt (mx.array): Tokenized prompt.
+        prompt (mx.array): Input prompt tensor.
         model (nn.Module): LLaDA model.
         tokenizer: Tokenizer instance.
         steps (int): Number of diffusion steps.
         gen_length (int): Length of generated sequence.
-        noise_temperature (float): Temperature for noise sampling (unused here).
-        cfg_scale (float): Classifier-free guidance scale (unused here).
+        noise_temperature (float): Temperature for noise (unused here).
+        cfg_scale (float): Classifier-free guidance scale.
         remasking (str): Remasking strategy ('low_confidence').
         mask_token_id (int, optional): ID for [MASK] token.
         verbose (bool): Print debug information.
@@ -264,6 +264,10 @@ def diffusion_generate(
     # Diffusion timesteps using MLX linspace
     timesteps = mx.linspace(1.0, 0.0, steps + 1)[:-1]
 
+    # Precompute prompt mask for CFG (True where prompt tokens are)
+    prompt_mask = mx.arange(seq_len) < prompt_length  # Shape: [seq_len]
+    prompt_mask = prompt_mask[None, :]  # Shape: [1, seq_len]
+
     for step, t in enumerate(timesteps):
         # Compute mask condition and count before update
         mask_condition = (x == mask_token_id)
@@ -272,12 +276,25 @@ def diffusion_generate(
         if num_masks == 0:
             break
 
-        # Get logits with full attention
-        logits = model(x, mask=mask)
+        # CFG implementation
+        if cfg_scale > 0.0:
+            # Create unconditional input by masking prompt
+            un_x = mx.where(prompt_mask, mask_token_id, x)  # Mask prompt tokens
+            # Concatenate conditional and unconditional inputs along batch dimension
+            x_ = mx.concatenate([x, un_x], axis=0)  # Shape: [2, seq_len]
+            # Get logits for both
+            logits = model(x_, mask=mask)  # Shape: [2, seq_len, vocab_size]
+            # Split into conditional and unconditional logits
+            logits, un_logits = mx.split(logits, 2, axis=0)  # Each: [1, seq_len, vocab_size]
+            # Apply CFG formula
+            logits = un_logits + (cfg_scale + 1) * (logits - un_logits)
+        else:
+            # Single forward pass without CFG
+            logits = model(x, mask=mask)
 
         # Sample predicted tokens
         probs = mx.softmax(logits, axis=-1)
-        x0 = mx.argmax(probs, axis=-1)
+        x0 = mx.argmax(probs, axis=-1)  # Shape: [1, seq_len]
 
         # Calculate tokens to unmask this step
         next_t = t - 1.0 / steps if step < steps - 1 else 0
@@ -287,33 +304,56 @@ def diffusion_generate(
 
         if tokens_to_unmask > 0 and num_masks > 0:
             # Get confidence scores for masked positions
-            confidence_scores = mx.max(probs, axis=-1)
-            masked_confidences = mx.where(mask_condition, confidence_scores, mx.full(confidence_scores.shape, -1e9))
+            confidence_scores = mx.max(probs, axis=-1)  # Shape: [1, seq_len]
+            # MLX Constraint 4: No full_like, use mx.full with shape
+            masked_confidences = mx.where(
+                mask_condition,
+                confidence_scores,
+                mx.full(confidence_scores.shape, -1e9)
+            )
             flat_confidences = masked_confidences.flatten()
 
-            # Sort confidences descending
+            # MLX Constraint 6: argsort ascending only, reverse for descending
             sorted_indices = mx.argsort(flat_confidences)[::-1]
             unmask_indices = sorted_indices[:min(tokens_to_unmask, num_masks)]
 
-            # Update only the top-confidence masked positions
+            # MLX Constraint 2: Limited mx.where, build condition iteratively
             new_condition = mx.full(x.shape, False, dtype=mx.bool_)
             for idx in unmask_indices:
-                new_condition = mx.where(mx.arange(seq_len) == idx % seq_len, True, new_condition)
+                # Create a mask for this position
+                pos_condition = (mx.arange(seq_len) == idx % seq_len)[None, :]
+                new_condition = mx.where(pos_condition, True, new_condition)
+
+            # Update sequence with predicted tokens at selected positions
             x = mx.where(new_condition & mask_condition, x0, x)
 
         if verbose:
-            # Sampled tokens for display (first 5 where mask was true)
-            sampled_tokens = mx.where(mask_condition, x0, mx.full(x0.shape, -1)).flatten()
-            valid_indices = mx.argsort(sampled_tokens, axis=-1)[::-1]
-            sampled_display = mx.take(sampled_tokens, valid_indices[:min(5, num_masks)]).tolist()
-            current_text = tokenizer.decode(x[0, prompt_length:].tolist(), skip_special_tokens=True)
+            # MLX Constraint 1: No boolean indexing, use argsort and take
+            sampled_tokens = mx.where(
+                mask_condition,
+                x0,
+                mx.full(x0.shape, -1)
+            ).flatten()
+            # Sort to get valid tokens first (descending), take top 5
+            valid_indices = mx.argsort(sampled_tokens)[::-1]
+            sampled_display = mx.take(
+                sampled_tokens,
+                valid_indices[:min(5, num_masks)]
+            ).tolist()
+            current_text = tokenizer.decode(
+                x[0, prompt_length:].tolist(),
+                skip_special_tokens=True
+            )
             print(f"[DEBUG] Step {step}: Sample predicted tokens for masked positions: {sampled_display}")
             print(f"[DEBUG] Step {step}: Masks remaining: {mx.sum(x == mask_token_id).item()}")
             print(f"[DEBUG] Tokens to unmask: {tokens_to_unmask}")
             print(f"[DEBUG] Current response: {current_text or '...'}")
 
     if verbose:
-        final_text = tokenizer.decode(x[0, prompt_length:].tolist(), skip_special_tokens=True)
+        final_text = tokenizer.decode(
+            x[0, prompt_length:].tolist(),
+            skip_special_tokens=True
+        )
         print(f"[DEBUG] Final generated text: {final_text}")
 
     return x
