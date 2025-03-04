@@ -209,15 +209,6 @@ def maybe_quantize_kv_cache(prompt_cache, quantized_kv_start, kv_group_size, kv_
                 )
 
 
-def _add_gumbel_noise(logits: mx.array, noise_temperature: float = 0.0) -> mx.array:
-    """Add Gumbel noise to logits for sampling."""
-    if noise_temperature <= 0.0:
-        return logits
-    u = mx.random.uniform(logits.shape)
-    g = -mx.log(-mx.log(u)) * noise_temperature
-    return logits + g
-
-
 def diffusion_generate(
     prompt: mx.array,
     model: nn.Module,
@@ -225,14 +216,15 @@ def diffusion_generate(
     *,
     steps: int = 64,
     gen_length: int = 64,
-    noise_temperature: float = 0.0,
+    noise_temp: float = 0.0,
     cfg_scale: float = 0.0,
     remasking: str = "low_confidence",
-    mask_token_id: Optional[int] = None,
+    mask_token_id: int = None,
     verbose: bool = False,
+    diffusion_seed: Optional[int] = None,
 ) -> mx.array:
     """
-    Generate text using diffusion-based progressive unmasking and CFG support
+    Generate text using a diffusion-based approach with stabilized Gumbel noise.
 
     Args:
         prompt (mx.array): Input prompt tensor.
@@ -240,11 +232,13 @@ def diffusion_generate(
         tokenizer: Tokenizer instance.
         steps (int): Number of diffusion steps.
         gen_length (int): Length of generated sequence.
-        noise_temperature (float): Temperature for noise (unused here).
+        noise_temp (float): Temperature for Gumbel noise, controlling sharpness.
         cfg_scale (float): Classifier-free guidance scale.
         remasking (str): Remasking strategy ('low_confidence').
         mask_token_id (int, optional): ID for [MASK] token.
         verbose (bool): Print debug information.
+        diffusion_seed (Optional[int]): Seed for generating the stochastic diffusion process.
+            When not provided, the current time in nanoseconds is used for randomness.
 
     Returns:
         mx.array: Generated token sequence.
@@ -264,9 +258,31 @@ def diffusion_generate(
     # Diffusion timesteps using MLX linspace
     timesteps = mx.linspace(1.0, 0.0, steps + 1)[:-1]
 
-    # Precompute prompt mask for CFG (True where prompt tokens are)
+    # Precompute prompt mask for CFG
     prompt_mask = mx.arange(seq_len) < prompt_length  # Shape: [seq_len]
     prompt_mask = prompt_mask[None, :]  # Shape: [1, seq_len]
+
+    # Initialize PRNG with a dedicated diffusion seed. If none is provided, use the current time.
+    if diffusion_seed is None:
+        diffusion_seed = int(time.time_ns())
+    master_key = mx.random.key(diffusion_seed)
+    step_keys = mx.random.split(master_key, steps)
+
+    # Stabilized Gumbel noise function
+    def stabilized_gumbel(key, shape):
+        uniform = mx.random.uniform(low=1e-7, high=1 - 1e-7, shape=shape, dtype=mx.float32, key=key)
+        return -mx.log(-mx.log(uniform))
+
+    # Gumbel sampling with temperature scaling
+    def gumbel_argmax(logits, temp, key):
+        if temp <= 0.0:
+            probs = mx.softmax(logits, axis=-1)
+            return mx.argmax(probs, axis=-1)
+        gumbel_noise = stabilized_gumbel(key, logits.shape)
+        if verbose and step == 0:  # Log noise on first step
+            print(f"[DEBUG] Gumbel noise sample (first 5): {gumbel_noise.flatten()[:5].tolist()}")
+        scaled_logits = (logits + gumbel_noise) / temp
+        return mx.argmax(scaled_logits, axis=-1)
 
     for step, t in enumerate(timesteps):
         # Compute mask condition and count before update
@@ -278,63 +294,50 @@ def diffusion_generate(
 
         # CFG implementation
         if cfg_scale > 0.0:
-            # Create unconditional input by masking prompt
-            un_x = mx.where(prompt_mask, mask_token_id, x)  # Mask prompt tokens
-            # Concatenate conditional and unconditional inputs along batch dimension
-            x_ = mx.concatenate([x, un_x], axis=0)  # Shape: [2, seq_len]
-            # Get logits for both
-            logits = model(x_, mask=mask)  # Shape: [2, seq_len, vocab_size]
-            # Split into conditional and unconditional logits
-            logits, un_logits = mx.split(logits, 2, axis=0)  # Each: [1, seq_len, vocab_size]
-            # Apply CFG formula
+            un_x = mx.where(prompt_mask, mask_token_id, x)
+            x_ = mx.concatenate([x, un_x], axis=0)
+            logits = model(x_, mask=mask)
+            logits, un_logits = mx.split(logits, 2, axis=0)
             logits = un_logits + (cfg_scale + 1) * (logits - un_logits)
         else:
             # Single forward pass without CFG
             logits = model(x, mask=mask)
 
-        # Sample predicted tokens
-        probs = mx.softmax(logits, axis=-1)
-        x0 = mx.argmax(probs, axis=-1)  # Shape: [1, seq_len]
+        # Apply stabilized Gumbel noise and sample
+        x0 = gumbel_argmax(logits, noise_temp, step_keys[step])
 
         # Calculate tokens to unmask this step
         next_t = t - 1.0 / steps if step < steps - 1 else 0
         current_masks = int(t * gen_length)
         next_masks = int(next_t * gen_length)
-        tokens_to_unmask = max(1, current_masks - next_masks)  # Ensure at least 1
+        tokens_to_unmask = max(1, current_masks - next_masks)
 
         if tokens_to_unmask > 0 and num_masks > 0:
             # Get confidence scores for masked positions
-            confidence_scores = mx.max(probs, axis=-1)  # Shape: [1, seq_len]
-            # MLX Constraint 4: No full_like, use mx.full with shape
+            probs = mx.softmax(logits, axis=-1)  # Still needed for remasking
+            confidence_scores = mx.max(probs, axis=-1)
             masked_confidences = mx.where(
                 mask_condition,
                 confidence_scores,
                 mx.full(confidence_scores.shape, -1e9)
             )
             flat_confidences = masked_confidences.flatten()
-
-            # MLX Constraint 6: argsort ascending only, reverse for descending
             sorted_indices = mx.argsort(flat_confidences)[::-1]
             unmask_indices = sorted_indices[:min(tokens_to_unmask, num_masks)]
 
-            # MLX Constraint 2: Limited mx.where, build condition iteratively
             new_condition = mx.full(x.shape, False, dtype=mx.bool_)
             for idx in unmask_indices:
-                # Create a mask for this position
                 pos_condition = (mx.arange(seq_len) == idx % seq_len)[None, :]
                 new_condition = mx.where(pos_condition, True, new_condition)
 
-            # Update sequence with predicted tokens at selected positions
             x = mx.where(new_condition & mask_condition, x0, x)
 
         if verbose:
-            # MLX Constraint 1: No boolean indexing, use argsort and take
             sampled_tokens = mx.where(
                 mask_condition,
                 x0,
                 mx.full(x0.shape, -1)
             ).flatten()
-            # Sort to get valid tokens first (descending), take top 5
             valid_indices = mx.argsort(sampled_tokens)[::-1]
             sampled_display = mx.take(
                 sampled_tokens,
@@ -675,11 +678,12 @@ def stream_generate(
         diffusion_kwargs = {
             "steps": kwargs.pop("steps", 64),
             "gen_length": kwargs.pop("gen_length", 128),
-            "noise_temperature": kwargs.pop("noise_temperature", 0.0),
+            "noise_temp": kwargs.pop("noise_temp", 0.0),
             "cfg_scale": kwargs.pop("cfg_scale", 0.0),
             "remasking": kwargs.pop("remasking", "low_confidence"),
             "mask_token_id": kwargs.pop("mask_token_id", None),
-            "verbose": kwargs.get("verbose", False),  # Ensure verbose is passed
+            "diffusion_seed": kwargs.pop("diffusion_seed", None),
+            "verbose": kwargs.get("verbose", False),  
         }
         with wired_limit(model, [generation_stream]):
             tic = time.perf_counter()
