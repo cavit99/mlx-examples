@@ -224,7 +224,7 @@ def diffusion_generate(
     diffusion_seed: Optional[int] = None,
 ) -> mx.array:
     """
-    Generate text using a diffusion-based approach with stabilized Gumbel noise.
+    Generate text using a diffusion-based approach with stabilized Gumbel noise and low-confidence remasking.
 
     Args:
         prompt (mx.array): Input prompt tensor.
@@ -234,15 +234,15 @@ def diffusion_generate(
         gen_length (int): Length of generated sequence.
         noise_temp (float): Temperature for Gumbel noise, controlling sharpness.
         cfg_scale (float): Classifier-free guidance scale.
-        remasking (str): Remasking strategy ('low_confidence').
+        remasking (str): Strategy for remasking ('low_confidence' or 'random').
         mask_token_id (int, optional): ID for [MASK] token.
         verbose (bool): Print debug information.
-        diffusion_seed (Optional[int]): Seed for generating the stochastic diffusion process.
-            When not provided, the current time in nanoseconds is used for randomness.
+        diffusion_seed (Optional[int]): Seed for diffusion process randomness.
 
     Returns:
         mx.array: Generated token sequence.
     """
+    # Default mask token ID from model if not provided
     mask_token_id = mask_token_id or getattr(model.args, "mask_token_id", 126336)
     batch_size = 1
     prompt_length = prompt.shape[0]
@@ -251,18 +251,19 @@ def diffusion_generate(
     # Initialize sequence with prompt and [MASK] tokens
     x = mx.full((batch_size, seq_len), mask_token_id, dtype=prompt.dtype)
     x[:, :prompt_length] = prompt
+    mx.eval(x)  # Resolve initial array
 
     # Full-attention mask (zeros allow attention to all positions)
     mask = mx.zeros((1, 1, seq_len, seq_len), dtype=x.dtype)
 
-    # Diffusion timesteps using MLX linspace
+    # Uniform timesteps from 1.0 to just above 0.0
     timesteps = mx.linspace(1.0, 0.0, steps + 1)[:-1]
 
     # Precompute prompt mask for CFG
     prompt_mask = mx.arange(seq_len) < prompt_length  # Shape: [seq_len]
     prompt_mask = prompt_mask[None, :]  # Shape: [1, seq_len]
 
-    # Initialize PRNG with a dedicated diffusion seed. If none is provided, use the current time.
+    # Initialize PRNG with diffusion seed or time-based fallback
     if diffusion_seed is None:
         diffusion_seed = int(time.time_ns())
     master_key = mx.random.key(diffusion_seed)
@@ -279,17 +280,18 @@ def diffusion_generate(
             probs = mx.softmax(logits, axis=-1)
             return mx.argmax(probs, axis=-1)
         gumbel_noise = stabilized_gumbel(key, logits.shape)
-        if verbose and step == 0:  # Log noise on first step
-            print(f"[DEBUG] Gumbel noise sample (first 5): {gumbel_noise.flatten()[:5].tolist()}")
         scaled_logits = (logits + gumbel_noise) / temp
         return mx.argmax(scaled_logits, axis=-1)
 
     for step, t in enumerate(timesteps):
-        # Compute mask condition and count before update
+        # Compute current mask condition and count
         mask_condition = (x == mask_token_id)
-        num_masks = mx.sum(mask_condition).item()
+        num_masks = int(mx.sum(mask_condition).item())
+        current_unmasked = int(mx.sum(x != mask_token_id).item()) - prompt_length
 
         if num_masks == 0:
+            if verbose:
+                print(f"[DEBUG] Step {step}: No masks remaining, stopping early")
             break
 
         # CFG implementation
@@ -300,64 +302,70 @@ def diffusion_generate(
             logits, un_logits = mx.split(logits, 2, axis=0)
             logits = un_logits + (cfg_scale + 1) * (logits - un_logits)
         else:
-            # Single forward pass without CFG
             logits = model(x, mask=mask)
+        mx.eval(logits)  # Resolve logits
 
-        # Apply stabilized Gumbel noise and sample
+        # Sample predictions with Gumbel noise
         x0 = gumbel_argmax(logits, noise_temp, step_keys[step])
 
-        # Calculate tokens to unmask this step
-        next_t = t - 1.0 / steps if step < steps - 1 else 0
-        current_masks = int(t * gen_length)
-        next_masks = int(next_t * gen_length)
-        tokens_to_unmask = max(1, current_masks - next_masks)
+        # Compute confidence scores
+        probs = mx.softmax(logits, axis=-1)
+        confidence_scores = mx.max(probs, axis=-1)  # Shape: [1, seq_len]
+
+        # Mask confidences for unmasked positions
+        masked_confidences = mx.where(
+            mask_condition,
+            confidence_scores,
+            mx.full(confidence_scores.shape, -1e9, dtype=confidence_scores.dtype)
+        )
+
+        # Calculate target unmasked tokens for next timestep
+        s = t - 1.0 / steps if step < steps - 1 else 0
+        n_un = int(mx.round(gen_length * (1 - s)).item())  # Target unmasked tokens
+        tokens_to_unmask = int(mx.maximum(0, n_un - current_unmasked).item()) 
 
         if tokens_to_unmask > 0 and num_masks > 0:
-            # Get confidence scores for masked positions
-            probs = mx.softmax(logits, axis=-1)  # Still needed for remasking
-            confidence_scores = mx.max(probs, axis=-1)
-            masked_confidences = mx.where(
-                mask_condition,
-                confidence_scores,
-                mx.full(confidence_scores.shape, -1e9)
-            )
-            flat_confidences = masked_confidences.flatten()
-            sorted_indices = mx.argsort(flat_confidences)[::-1]
-            unmask_indices = sorted_indices[:min(tokens_to_unmask, num_masks)]
+            if remasking == "low_confidence":
+                flat_confidences = masked_confidences.flatten()
+                sorted_indices = mx.argsort(flat_confidences)[::-1]  # High to low
+                num_to_unmask = int(min(tokens_to_unmask, num_masks)) 
+                if num_to_unmask > 0:
+                    indices_to_take = mx.arange(num_to_unmask, dtype=mx.int32)
+                    unmask_indices = mx.take(sorted_indices, indices_to_take)
+                else:
+                    unmask_indices = mx.array([], dtype=mx.int32)
 
-            new_condition = mx.full(x.shape, False, dtype=mx.bool_)
-            for idx in unmask_indices:
-                pos_condition = (mx.arange(seq_len) == idx % seq_len)[None, :]
-                new_condition = mx.where(pos_condition, True, new_condition)
+                unmask_mask = mx.zeros((batch_size, seq_len), dtype=mx.bool_)
+                unmask_mask[:, unmask_indices] = True 
+                x = mx.where(unmask_mask & mask_condition, x0, x)
+            elif remasking == "random":
+                mask_probs = mx.random.uniform(shape=x.shape, key=step_keys[step])
+                x = mx.where(mask_condition & (mask_probs < s / t), mask_token_id, x0)
+            else:
+                raise ValueError(f"Unknown remasking strategy: {remasking}")
 
-            x = mx.where(new_condition & mask_condition, x0, x)
+            mx.eval(x)
 
+        # Debugging output
         if verbose:
-            sampled_tokens = mx.where(
-                mask_condition,
-                x0,
-                mx.full(x0.shape, -1)
-            ).flatten()
-            valid_indices = mx.argsort(sampled_tokens)[::-1]
-            sampled_display = mx.take(
-                sampled_tokens,
-                valid_indices[:min(5, num_masks)]
-            ).tolist()
+            if step == 0:
+                gumbel_noise = stabilized_gumbel(step_keys[step], logits.shape)
+                print(f"[DEBUG] Step {step}: Gumbel noise sample (first 5): {gumbel_noise.flatten()[:5].tolist()}")
+            
             current_text = tokenizer.decode(
                 x[0, prompt_length:].tolist(),
                 skip_special_tokens=True
             )
-            print(f"[DEBUG] Step {step}: Sample predicted tokens for masked positions: {sampled_display}")
-            print(f"[DEBUG] Step {step}: Masks remaining: {mx.sum(x == mask_token_id).item()}")
-            print(f"[DEBUG] Tokens to unmask: {tokens_to_unmask}")
-            print(f"[DEBUG] Current response: {current_text or '...'}")
-
-    if verbose:
-        final_text = tokenizer.decode(
-            x[0, prompt_length:].tolist(),
-            skip_special_tokens=True
-        )
-        print(f"[DEBUG] Final generated text: {final_text}")
+            print(f"[DEBUG] Step {step}: Timestep t={t:.5f}, s={s:.5f}")
+            print(f"[DEBUG] Step {step}: Target unmasked: {n_un}, Actual unmasked: {current_unmasked + tokens_to_unmask}")
+            print(f"[DEBUG] Step {step}: Tokens unmasked this step: {tokens_to_unmask}")
+            if remasking == "low_confidence" and tokens_to_unmask > 0:
+                top_conf = mx.take(flat_confidences, unmask_indices).tolist() if num_to_unmask > 0 else []
+                print(f"[DEBUG] Step {step}: Top {num_to_unmask} confidence scores: {top_conf}")
+            print(f"[DEBUG] Step {step}: Masks remaining: {num_masks}")
+            print(f"[DEBUG] Step {step}: Current response: {current_text or '...'}")
+            if cfg_scale > 0.0:
+                print(f"[DEBUG] Step {step}: CFG applied with scale={cfg_scale}")
 
     return x
 
@@ -656,7 +664,6 @@ def stream_generate(
         GenerationResponse: An instance containing the generated text segment and
             associated metadata. See :class:`GenerationResponse` for details.
     """
-    print("[TRACE] Entering stream_generate")  # Temporary trace
     if not isinstance(tokenizer, TokenizerWrapper):
         tokenizer = TokenizerWrapper(tokenizer)
 
@@ -674,7 +681,6 @@ def stream_generate(
     print(f"[TRACE] Model type: {model_type}, Verbose: {kwargs.get('verbose', False)}")  # Check model type and verbose
 
     if model_type == "llada":
-        print("[TRACE] Using diffusion_generate for LLaDA")  # Confirm diffusion path
         diffusion_kwargs = {
             "steps": kwargs.pop("steps", 64),
             "gen_length": kwargs.pop("gen_length", 128),
@@ -692,7 +698,6 @@ def stream_generate(
             prompt_tps = prompt.size / prompt_time
             generated_tokens = output_sequence[0, prompt.size:]
             generated_text = tokenizer.decode(generated_tokens.tolist(), skip_special_tokens=True)
-            print(f"[TRACE] Generated tokens: {generated_tokens.tolist()[:10]}, Text: {generated_text}")  # Check output
             yield GenerationResponse(
                 text=generated_text,
                 token=generated_tokens[-1].item() if generated_tokens.size > 0 else None,
@@ -705,7 +710,6 @@ def stream_generate(
                 finish_reason="length",
             )
     else:
-        print("[TRACE] Using autoregressive generation")  # Confirm fallback path
         if draft_model is None:
             kwargs.pop("num_draft_tokens", None)
             token_generator = generate_step(prompt, model, **kwargs)
@@ -768,7 +772,6 @@ def generate(
        kwargs: The remaining options get passed to :func:`stream_generate`.
           See :func:`stream_generate` for more details.
     """
-    print(f"[TRACE] Entering generate, Verbose: {verbose}")  # Temporary trace
     if formatter is not None:
         print(
             "[Warning] Text formatting is deprecated and no longer used. "
