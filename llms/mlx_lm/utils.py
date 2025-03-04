@@ -218,7 +218,6 @@ def diffusion_generate(
     gen_length: int = 64,
     noise_temp: float = 0.0,
     cfg_scale: float = 0.0,
-    remasking: str = "low_confidence",
     mask_token_id: int = None,
     verbose: bool = False,
     diffusion_seed: Optional[int] = None,
@@ -234,7 +233,6 @@ def diffusion_generate(
         gen_length (int): Length of generated sequence.
         noise_temp (float): Temperature for Gumbel noise, controlling sharpness.
         cfg_scale (float): Classifier-free guidance scale.
-        remasking (str): Strategy for remasking ('low_confidence' or 'random').
         mask_token_id (int, optional): ID for [MASK] token.
         verbose (bool): Print debug information.
         diffusion_seed (Optional[int]): Seed for diffusion process randomness.
@@ -322,48 +320,73 @@ def diffusion_generate(
         # Calculate target unmasked tokens for next timestep
         s = t - 1.0 / steps if step < steps - 1 else 0
         n_un = int(mx.round(gen_length * (1 - s)).item())  # Target unmasked tokens
-        tokens_to_unmask = int(mx.maximum(0, n_un - current_unmasked).item()) 
+        tokens_to_unmask = int(mx.maximum(0, n_un - current_unmasked).item())
 
         if tokens_to_unmask > 0 and num_masks > 0:
-            if remasking == "low_confidence":
-                flat_confidences = masked_confidences.flatten()
-                sorted_indices = mx.argsort(flat_confidences)[::-1]  # High to low
-                num_to_unmask = int(min(tokens_to_unmask, num_masks)) 
-                if num_to_unmask > 0:
-                    indices_to_take = mx.arange(num_to_unmask, dtype=mx.int32)
-                    unmask_indices = mx.take(sorted_indices, indices_to_take)
-                else:
-                    unmask_indices = mx.array([], dtype=mx.int32)
+            # Step 1: Tentatively unmask all masked positions
+            x_temp = mx.where(mask_condition, x0, x)
+            flat_confidences = masked_confidences.flatten()
+            sorted_indices = mx.argsort(flat_confidences)[::-1]  # High to low
+            num_to_unmask = int(min(tokens_to_unmask, num_masks))
+            num_to_remask = num_masks - num_to_unmask
 
-                unmask_mask = mx.zeros((batch_size, seq_len), dtype=mx.bool_)
-                unmask_mask[:, unmask_indices] = True 
-                x = mx.where(unmask_mask & mask_condition, x0, x)
-            elif remasking == "random":
-                mask_probs = mx.random.uniform(shape=x.shape, key=step_keys[step])
-                x = mx.where(mask_condition & (mask_probs < s / t), mask_token_id, x0)
+            # Unmasking
+            unmask_indices = mx.take(sorted_indices, mx.arange(num_to_unmask, dtype=mx.int32))
+            unmask_mask = mx.zeros((batch_size, seq_len), dtype=mx.bool_)
+            unmask_mask[:, unmask_indices] = True
+            unmask_confidences = mx.take(flat_confidences, unmask_indices).tolist()
+            unmask_tokens = mx.take(x0, unmask_indices).tolist()
+
+            # Remasking
+            if num_to_remask > 0:
+                remask_indices = mx.take(sorted_indices[num_to_unmask:], mx.arange(num_to_remask, dtype=mx.int32))
+                remask_mask = mx.zeros((batch_size, seq_len), dtype=mx.bool_)
+                remask_mask[:, remask_indices] = True
+                remask_confidences = mx.take(flat_confidences, remask_indices).tolist()
+                remask_tokens = mx.take(x_temp, remask_indices).tolist()
+                x = mx.where(remask_mask & mask_condition, mask_token_id, x_temp)
             else:
-                raise ValueError(f"Unknown remasking strategy: {remasking}")
+                x = x_temp
 
-            mx.eval(x)
+        mx.eval(x)
 
-        # Debugging output
+        # Detailed verbose logging
         if verbose:
             if step == 0:
                 gumbel_noise = stabilized_gumbel(step_keys[step], logits.shape)
                 print(f"[DEBUG] Step {step}: Gumbel noise sample (first 5): {gumbel_noise.flatten()[:5].tolist()}")
-            
-            current_text = tokenizer.decode(
-                x[0, prompt_length:].tolist(),
-                skip_special_tokens=True
-            )
             print(f"[DEBUG] Step {step}: Timestep t={t:.5f}, s={s:.5f}")
-            print(f"[DEBUG] Step {step}: Target unmasked: {n_un}, Actual unmasked: {current_unmasked + tokens_to_unmask}")
-            print(f"[DEBUG] Step {step}: Tokens unmasked this step: {tokens_to_unmask}")
-            if remasking == "low_confidence" and tokens_to_unmask > 0:
-                top_conf = mx.take(flat_confidences, unmask_indices).tolist() if num_to_unmask > 0 else []
-                print(f"[DEBUG] Step {step}: Top {num_to_unmask} confidence scores: {top_conf}")
-            print(f"[DEBUG] Step {step}: Masks remaining: {num_masks}")
+            print(f"[DEBUG] Step {step}: Target unmasked: {n_un}, Actual unmasked: {current_unmasked + (num_to_unmask)}")
+            print(f"[DEBUG] Step {step}: Tokens unmasked this step: {num_to_unmask}")
+            
+            if num_to_unmask > 0:
+                unmask_details = [
+                    f"Pos {idx + prompt_length}: Token {tok} (Conf {conf:.4f})"
+                    for idx, (tok, conf) in zip(unmask_indices.tolist(), zip(unmask_tokens, unmask_confidences))
+                ]
+                print(f"[DEBUG] Step {step}: Unmasked: {', '.join(unmask_details)}")
+                print(f"[DEBUG] Step {step}: Tokens remasked this step: {num_to_remask}")
+                if num_to_remask > 0:
+                    remask_details = [
+                        f"Pos {idx + prompt_length}: Token {tok} -> [MASK] (Conf {conf:.4f})"
+                        for idx, (tok, conf) in zip(remask_indices.tolist(), zip(remask_tokens, remask_confidences))
+                    ]
+                    print(f"[DEBUG] Step {step}: Remasked: {', '.join(remask_details)}")
+
+            # Full sequence state for response part
+            response_tokens = x[0, prompt_length:].tolist()
+            state = [
+                tokenizer.decode([tok], skip_special_tokens=True) if tok != mask_token_id else "[MASK]"
+                for tok in response_tokens
+            ]
+            print(f"[DEBUG] Step {step}: State: {' '.join(state)}")
+            current_text = tokenizer.decode(
+                response_tokens,
+                skip_special_tokens=True,
+                clean_up_tokenization_spaces=True
+            )
             print(f"[DEBUG] Step {step}: Current response: {current_text or '...'}")
+            print(f"[DEBUG] Step {step}: Masks remaining: {int(mx.sum(x == mask_token_id).item())}")
             if cfg_scale > 0.0:
                 print(f"[DEBUG] Step {step}: CFG applied with scale={cfg_scale}")
 
@@ -686,7 +709,6 @@ def stream_generate(
             "gen_length": kwargs.pop("gen_length", 128),
             "noise_temp": kwargs.pop("noise_temp", 0.0),
             "cfg_scale": kwargs.pop("cfg_scale", 0.0),
-            "remasking": kwargs.pop("remasking", "low_confidence"),
             "mask_token_id": kwargs.pop("mask_token_id", None),
             "diffusion_seed": kwargs.pop("diffusion_seed", None),
             "verbose": kwargs.get("verbose", False),  
