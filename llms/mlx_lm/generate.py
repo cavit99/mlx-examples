@@ -1,8 +1,9 @@
-# Copyright © 2023-2024 Apple Inc.
+# Copyright © 2023-2025 Apple Inc.
 
 import argparse
 import json
 import sys
+import time
 
 import mlx.core as mx
 
@@ -276,54 +277,42 @@ def main():
     else:
         draft_model = None
 
-    # Determine model type and generate accordingly
+    # Determine model type
     model_type = getattr(model.args, "model_type", None)
 
+    # Prepare generation arguments based on model type
     if model_type == "llada":
-        # LLaDA-specific diffusion generation
-        if using_cache:
-            raise ValueError("Prompt cache is not supported for LLaDA models.")
-
-        # Convert prompt from list to mx.array
-        prompt = mx.array(prompt)
-
-        response = diffusion_generate(
-            prompt,
-            model,
-            tokenizer,
-            steps=args.steps,
-            gen_length=args.gen_length,
-            block_length=args.block_length,
-            noise_temp=args.noise_temp,
-            cfg=args.cfg,
-            diffusion_seed=args.seed,
-            verbose=args.verbose,
-        )
+        generation_args = {
+            "verbose": args.verbose,
+            "steps": args.steps,
+            "gen_length": args.gen_length,
+            "block_length": args.block_length,
+            "noise_temp": args.noise_temp,
+            "cfg": args.cfg,
+            "diffusion_seed": args.seed,
+        }
     else:
-        # Autoregressive generation
-        sampler = make_sampler(
-            args.temp, args.top_p, args.min_p, args.min_tokens_to_keep
-        )
-        response = generate(
-            model,
-            tokenizer,
-            prompt,
-            max_tokens=args.max_tokens,
-            verbose=args.verbose,
-            sampler=sampler,
-            max_kv_size=args.max_kv_size,
-            prompt_cache=prompt_cache if using_cache else None,
-            kv_bits=args.kv_bits,
-            kv_group_size=args.kv_group_size,
-            quantized_kv_start=args.quantized_kv_start,
-            draft_model=draft_model,
-            num_draft_tokens=args.num_draft_tokens,
-        )
+        generation_args = {
+            "max_tokens": args.max_tokens,
+            "sampler": make_sampler(
+                args.temp, args.top_p, args.min_p, args.min_tokens_to_keep
+            ),
+            "verbose": args.verbose,
+            "max_kv_size": args.max_kv_size,
+            "prompt_cache": prompt_cache if using_cache else None,
+            "kv_bits": args.kv_bits,
+            "kv_group_size": args.kv_group_size,
+            "quantized_kv_start": args.quantized_kv_start,
+            "draft_model": draft_model,
+            "num_draft_tokens": args.num_draft_tokens,
+        }
 
-        # For autoregressive models, print the response if not verbose
-        # (verbose=True is already handled inside generate())
-        if not args.verbose:
-            print(response)
+    # Generate response using the unified generate function
+    response = generate(model, tokenizer, prompt, **generation_args)
+
+    # Print the response if not verbose (verbose output is handled in generate)
+    if not args.verbose:
+        print(response)
 
 
 if __name__ == "__main__":

@@ -252,9 +252,8 @@ def diffusion_generate(
     # If block_length is None, use full gen_length (non-block mode)
     block_length = block_length or gen_length
 
-    # Calculate number of blocks and steps per block
+    # Calculate number of blocks
     num_blocks = (gen_length + block_length - 1) // block_length  # Ceiling division
-    steps_per_block = steps // num_blocks
 
     if verbose:
         print(f"Generating with diffusion model: {steps} steps, {gen_length} tokens")
@@ -291,6 +290,7 @@ def diffusion_generate(
         return mx.argmax(scaled_logits, axis=-1)
 
     # Process each block sequentially
+    total_steps_used = 0
     for block_idx in range(num_blocks):
         if verbose:
             # Print a simple header for each block if this is not the first block
@@ -302,45 +302,42 @@ def diffusion_generate(
         block_end = min(prompt_length + (block_idx + 1) * block_length, seq_len)
         block_size = block_end - block_start
 
+        # Allocate steps proportionally to block size, ensuring all steps are used
+        steps_per_block = (steps * block_size + gen_length - 1) // gen_length
+        if block_idx == num_blocks - 1:
+            steps_per_block = (
+                steps - total_steps_used
+            )  # Use remaining steps for last block
+        total_steps_used += steps_per_block
+
         # Create step keys for this block
         step_keys = mx.random.split(block_keys[block_idx], steps_per_block)
 
         # Create timesteps for this block
         timesteps = mx.linspace(1.0, 0.0, steps_per_block + 1)[:-1]
 
-        # Precompute prompt and block masks for CFG
-        block_mask = (
+        # Precompute prompt and block masks for CFG and unmasking
+        block_mask = (mx.arange(seq_len) >= block_start) & (
             mx.arange(seq_len) < block_end
-        )  # Positions in current and previous blocks
-        prompt_mask = mx.arange(seq_len) < prompt_length  # Prompt positions only
-
-        # Reshape masks for broadcasting
+        )
+        prompt_mask = mx.arange(seq_len) < prompt_length
         block_mask = block_mask[None, :]  # Shape: [1, seq_len]
         prompt_mask = prompt_mask[None, :]  # Shape: [1, seq_len]
 
         for step, t in enumerate(timesteps):
-            # Compute current mask condition and count within the current block
+            # Compute current mask condition within the block
             mask_condition = x == mask_token_id
-            block_mask_condition = (
-                mask_condition
-                & (mx.arange(seq_len)[None, :] >= block_start)
-                & (mx.arange(seq_len)[None, :] < block_end)
-            )
+            block_mask_condition = mask_condition & block_mask
 
             num_masks_in_block = int(mx.sum(block_mask_condition).item())
-            current_unmasked_in_block = int(
-                mx.sum(
-                    (x != mask_token_id)
-                    & (mx.arange(seq_len)[None, :] >= block_start)
-                    & (mx.arange(seq_len)[None, :] < block_end)
-                ).item()
-            )
+            current_unmasked_in_block = int(mx.sum(~mask_condition & block_mask).item())
 
             if num_masks_in_block == 0:
-                # No need for debug message about no masks
+                if verbose:
+                    print(f"Block {block_idx + 1} fully unmasked at step {step + 1}")
                 break
 
-            # CFG implementation
+            # CFG implementation (full sequence for bidirectional context)
             if cfg > 0.0:
                 un_x = mx.where(prompt_mask, mask_token_id, x)
                 x_ = mx.concatenate([x, un_x], axis=0)
@@ -375,15 +372,10 @@ def diffusion_generate(
             )
 
             if tokens_to_unmask > 0 and num_masks_in_block > 0:
-                # Step 1: Tentatively unmask masked positions in current block
-                x_temp = mx.where(mask_condition, x0, x)
+                # Unmask only within the current block
                 flat_confidences = masked_confidences.flatten()
-
-                # Get indices sorted by confidence (high to low)
                 sorted_indices = mx.argsort(flat_confidences)[::-1]  # High to low
-
                 num_to_unmask = int(min(tokens_to_unmask, num_masks_in_block))
-                num_to_remask = num_masks_in_block - num_to_unmask
 
                 # Unmasking
                 unmask_indices = mx.take(
@@ -391,31 +383,12 @@ def diffusion_generate(
                 )
                 unmask_mask = mx.zeros((batch_size, seq_len), dtype=mx.bool_)
                 unmask_mask[:, unmask_indices] = True
-                unmask_confidences = mx.take(flat_confidences, unmask_indices).tolist()
-                unmask_tokens = mx.take(x0, unmask_indices).tolist()
-
-                # Remasking
-                if num_to_remask > 0:
-                    remask_indices = mx.take(
-                        sorted_indices[num_to_unmask:],
-                        mx.arange(num_to_remask, dtype=mx.int32),
-                    )
-                    remask_mask = mx.zeros((batch_size, seq_len), dtype=mx.bool_)
-                    remask_mask[:, remask_indices] = True
-                    remask_confidences = mx.take(
-                        flat_confidences, remask_indices
-                    ).tolist()
-                    remask_tokens = mx.take(x_temp, remask_indices).tolist()
-                    x = mx.where(
-                        remask_mask & block_mask_condition, mask_token_id, x_temp
-                    )
-                else:
-                    x = x_temp
+                x = mx.where(unmask_mask & block_mask_condition, x0, x)
 
             mx.eval(x)
 
             if verbose:
-                # Get the response part of the sequence
+                # Get the response part of the sequence up to current block
                 response_tokens = x[0, prompt_length:block_end].tolist()
 
                 try:
@@ -424,7 +397,7 @@ def diffusion_generate(
                         response_tokens, skip_special_tokens=True
                     )
 
-                    # Count how many masks remain
+                    # Count how many masks remain in current block
                     mask_count = response_tokens.count(mask_token_id)
                     total_tokens = len(response_tokens)
 
@@ -879,8 +852,11 @@ def generate(
        prompt (Union[str, List[int]]): The input prompt string or integer tokens.
        verbose (bool): If ``True``, print tokens and timing information.
            Default: ``False``.
-       kwargs: The remaining options get passed to :func:`stream_generate`.
-          See :func:`stream_generate` for more details.
+       kwargs: The remaining options get passed to :func:`stream_generate` or
+           :func:`diffusion_generate` depending on model type.
+           See those functions for more details.
+    Returns:
+        str: The generated text.
     """
     if formatter is not None:
         print(
@@ -893,52 +869,91 @@ def generate(
     # Check if this is a diffusion model
     model_type = getattr(model.args, "model_type", None)
     if model_type == "llada":
-        # For diffusion models, we need to handle prompt conversion and calling diffusion_generate
+        # For diffusion models, handle prompt conversion and call diffusion_generate
         prompt_tensor = (
             mx.array(prompt)
             if isinstance(prompt, list)
-            else tokenizer.encode(prompt, return_tensors="mlx")[0]
+            else tokenizer.encode(prompt, add_special_tokens=True)
         )
+
+        # Define valid diffusion arguments
+        valid_diffusion_args = [
+            "steps",
+            "gen_length",
+            "block_length",
+            "noise_temp",
+            "cfg",
+            "mask_token_id",
+            "diffusion_seed",
+            "verbose",
+        ]
+        # Filter diffusion-specific arguments
+        diffusion_kwargs = {
+            k: v for k, v in kwargs.items() if k in valid_diffusion_args
+        }
+        diffusion_kwargs["verbose"] = verbose  # Ensure verbose is always set
 
         # Record start time for metrics
         start_time = time.perf_counter()
 
-        # Call diffusion_generate with verbose parameter from the function args
+        # Generate with diffusion
         output_sequence, final_text = diffusion_generate(
             prompt_tensor,
             model,
             tokenizer,
-            verbose=verbose,  # Pass verbose from function parameter
-            **kwargs,
+            **diffusion_kwargs,
         )
 
         # Calculate metrics
         end_time = time.perf_counter()
         generation_time = end_time - start_time
+        prompt_tokens = prompt_tensor.size
+        generation_tokens = output_sequence.shape[1] - prompt_tokens
+        generation_tps = (
+            generation_tokens / generation_time if generation_time > 0 else 0
+        )
+        peak_memory = mx.metal.get_peak_memory() / 1e9
 
+        # Output based on verbose flag
         if verbose:
-            # Just print a simple separator and metrics
+            print(final_text)
             print("\n" + "=" * 10)
-            prompt_tokens = len(prompt_tensor)
-            generation_tokens = output_sequence.shape[1] - prompt_tokens
-            generation_tps = (
-                generation_tokens / generation_time if generation_time > 0 else 0
-            )
             print(f"Prompt: {prompt_tokens} tokens")
             print(
                 f"Generation: {generation_tokens} tokens, {generation_tps:.3f} tokens-per-sec"
             )
-            print(f"Peak memory: {mx.metal.get_peak_memory() / 1e9:.3f} GB")
-            print(f"\nFinal text: {final_text}")
+            print(f"Peak memory: {peak_memory:.3f} GB")
         else:
-            # In non-verbose mode, only print the final text
             print(final_text)
 
         return final_text
     else:
-        # For autoregressive models
+        # For autoregressive models, filter out diffusion-specific arguments
+        autoregressive_kwargs = {
+            k: v
+            for k, v in kwargs.items()
+            if k
+            in [
+                "max_tokens",
+                "sampler",
+                "logits_processors",
+                "max_kv_size",
+                "prompt_cache",
+                "prefill_step_size",
+                "kv_bits",
+                "kv_group_size",
+                "quantized_kv_start",
+                "draft_model",
+                "num_draft_tokens",
+                "verbose",
+            ]
+        }
+
+        # Generate text
         text = ""
-        for response in stream_generate(model, tokenizer, prompt, **kwargs):
+        for response in stream_generate(
+            model, tokenizer, prompt, **autoregressive_kwargs
+        ):
             if verbose:
                 print(response.text, end="", flush=True)
             text += response.text
@@ -948,16 +963,16 @@ def generate(
             print("=" * 10)
             if len(text) == 0:
                 print("No text generated for this prompt")
-                return
-            print(
-                f"Prompt: {response.prompt_tokens} tokens, "
-                f"{response.prompt_tps:.3f} tokens-per-sec"
-            )
-            print(
-                f"Generation: {response.generation_tokens} tokens, "
-                f"{response.generation_tps:.3f} tokens-per-sec"
-            )
-            print(f"Peak memory: {response.peak_memory:.3f} GB")
+            else:
+                print(
+                    f"Prompt: {response.prompt_tokens} tokens, "
+                    f"{response.prompt_tps:.3f} tokens-per-sec"
+                )
+                print(
+                    f"Generation: {response.generation_tokens} tokens, "
+                    f"{response.generation_tps:.3f} tokens-per-sec"
+                )
+                print(f"Peak memory: {response.peak_memory:.3f} GB")
         return text
 
 
