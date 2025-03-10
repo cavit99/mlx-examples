@@ -1,4 +1,4 @@
-# Copyright © 2023-2024 Apple Inc.
+# Copyright © 2023-2025 Apple Inc.
 
 import contextlib
 import copy
@@ -134,6 +134,7 @@ def _get_classes(config: dict):
     try:
         if model_type == "llada":
             from .models import llada
+
             return llada.LLaDAModelLM, llada.ModelArgs
         arch = importlib.import_module(f"mlx_lm.models.{model_type}")
     except ImportError:
@@ -269,7 +270,9 @@ def diffusion_generate(
 
     # Stabilized Gumbel noise function
     def stabilized_gumbel(key, shape):
-        uniform = mx.random.uniform(low=1e-7, high=1 - 1e-7, shape=shape, dtype=mx.float32, key=key)
+        uniform = mx.random.uniform(
+            low=1e-7, high=1 - 1e-7, shape=shape, dtype=mx.float32, key=key
+        )
         return -mx.log(-mx.log(uniform))
 
     # Gumbel sampling with temperature scaling
@@ -283,7 +286,7 @@ def diffusion_generate(
 
     for step, t in enumerate(timesteps):
         # Compute current mask condition and count
-        mask_condition = (x == mask_token_id)
+        mask_condition = x == mask_token_id
         num_masks = int(mx.sum(mask_condition).item())
         current_unmasked = int(mx.sum(x != mask_token_id).item()) - prompt_length
 
@@ -314,7 +317,7 @@ def diffusion_generate(
         masked_confidences = mx.where(
             mask_condition,
             confidence_scores,
-            mx.full(confidence_scores.shape, -1e9, dtype=confidence_scores.dtype)
+            mx.full(confidence_scores.shape, -1e9, dtype=confidence_scores.dtype),
         )
 
         # Calculate target unmasked tokens for next timestep
@@ -331,7 +334,9 @@ def diffusion_generate(
             num_to_remask = num_masks - num_to_unmask
 
             # Unmasking
-            unmask_indices = mx.take(sorted_indices, mx.arange(num_to_unmask, dtype=mx.int32))
+            unmask_indices = mx.take(
+                sorted_indices, mx.arange(num_to_unmask, dtype=mx.int32)
+            )
             unmask_mask = mx.zeros((batch_size, seq_len), dtype=mx.bool_)
             unmask_mask[:, unmask_indices] = True
             unmask_confidences = mx.take(flat_confidences, unmask_indices).tolist()
@@ -339,7 +344,10 @@ def diffusion_generate(
 
             # Remasking
             if num_to_remask > 0:
-                remask_indices = mx.take(sorted_indices[num_to_unmask:], mx.arange(num_to_remask, dtype=mx.int32))
+                remask_indices = mx.take(
+                    sorted_indices[num_to_unmask:],
+                    mx.arange(num_to_remask, dtype=mx.int32),
+                )
                 remask_mask = mx.zeros((batch_size, seq_len), dtype=mx.bool_)
                 remask_mask[:, remask_indices] = True
                 remask_confidences = mx.take(flat_confidences, remask_indices).tolist()
@@ -354,41 +362,71 @@ def diffusion_generate(
         if verbose:
             if step == 0:
                 gumbel_noise = stabilized_gumbel(step_keys[step], logits.shape)
-                print(f"[DEBUG] Step {step}: Gumbel noise sample (first 5): {gumbel_noise.flatten()[:5].tolist()}")
+                print(
+                    f"[DEBUG] Step {step}: Gumbel noise sample (first 5): {gumbel_noise.flatten()[:5].tolist()}"
+                )
             print(f"[DEBUG] Step {step}: Timestep t={t:.5f}, s={s:.5f}")
-            print(f"[DEBUG] Step {step}: Target unmasked: {n_un}, Actual unmasked: {current_unmasked + (num_to_unmask)}")
+            print(
+                f"[DEBUG] Step {step}: Target unmasked: {n_un}, Actual unmasked: {current_unmasked + (num_to_unmask)}"
+            )
             print(f"[DEBUG] Step {step}: Tokens unmasked this step: {num_to_unmask}")
-            
+
             if num_to_unmask > 0:
                 unmask_details = [
                     f"Pos {idx + prompt_length}: Token {tok} (Conf {conf:.4f})"
-                    for idx, (tok, conf) in zip(unmask_indices.tolist(), zip(unmask_tokens, unmask_confidences))
+                    for idx, (tok, conf) in zip(
+                        unmask_indices.tolist(), zip(unmask_tokens, unmask_confidences)
+                    )
                 ]
                 print(f"[DEBUG] Step {step}: Unmasked: {', '.join(unmask_details)}")
-                print(f"[DEBUG] Step {step}: Tokens remasked this step: {num_to_remask}")
+                print(
+                    f"[DEBUG] Step {step}: Tokens remasked this step: {num_to_remask}"
+                )
                 if num_to_remask > 0:
                     remask_details = [
                         f"Pos {idx + prompt_length}: Token {tok} -> [MASK] (Conf {conf:.4f})"
-                        for idx, (tok, conf) in zip(remask_indices.tolist(), zip(remask_tokens, remask_confidences))
+                        for idx, (tok, conf) in zip(
+                            remask_indices.tolist(),
+                            zip(remask_tokens, remask_confidences),
+                        )
                     ]
                     print(f"[DEBUG] Step {step}: Remasked: {', '.join(remask_details)}")
 
             # Full sequence state for response part
             response_tokens = x[0, prompt_length:].tolist()
             state = [
-                tokenizer.decode([tok], skip_special_tokens=True) if tok != mask_token_id else "[MASK]"
+                (
+                    tokenizer.decode([tok], skip_special_tokens=True)
+                    if tok != mask_token_id
+                    else "[MASK]"
+                )
                 for tok in response_tokens
             ]
             print(f"[DEBUG] Step {step}: State: {' '.join(state)}")
             current_text = tokenizer.decode(
                 response_tokens,
                 skip_special_tokens=True,
-                clean_up_tokenization_spaces=True
+                clean_up_tokenization_spaces=True,
             )
             print(f"[DEBUG] Step {step}: Current response: {current_text or '...'}")
-            print(f"[DEBUG] Step {step}: Masks remaining: {int(mx.sum(x == mask_token_id).item())}")
+            print(
+                f"[DEBUG] Step {step}: Masks remaining: {int(mx.sum(x == mask_token_id).item())}"
+            )
             if cfg_scale > 0.0:
                 print(f"[DEBUG] Step {step}: CFG applied with scale={cfg_scale}")
+
+            # Single-line progress display (even when verbose=False)
+            if (
+                not verbose and step % 5 == 0
+            ):  # Update every 5 steps to avoid flickering
+                response_tokens = x[0, prompt_length:].tolist()
+                current_text = tokenizer.decode(
+                    response_tokens,
+                    skip_special_tokens=True,
+                    clean_up_tokenization_spaces=True,
+                )
+                # Clear line and update in place
+                print(f"\rGenerating: {current_text or '...'}", end="", flush=True)
 
     return x
 
@@ -701,8 +739,6 @@ def stream_generate(
 
     detokenizer = tokenizer.detokenizer
     model_type = getattr(getattr(model, "args", None), "model_type", None)
-    print(f"[TRACE] Model type: {model_type}, Verbose: {kwargs.get('verbose', False)}")  # Check model type and verbose
-
     if model_type == "llada":
         diffusion_kwargs = {
             "steps": kwargs.pop("steps", 64),
@@ -711,18 +747,24 @@ def stream_generate(
             "cfg_scale": kwargs.pop("cfg_scale", 0.0),
             "mask_token_id": kwargs.pop("mask_token_id", None),
             "diffusion_seed": kwargs.pop("diffusion_seed", None),
-            "verbose": kwargs.get("verbose", False),  
+            "verbose": kwargs.get("verbose", False),
         }
         with wired_limit(model, [generation_stream]):
             tic = time.perf_counter()
-            output_sequence = diffusion_generate(prompt, model, tokenizer, **diffusion_kwargs)
+            output_sequence = diffusion_generate(
+                prompt, model, tokenizer, **diffusion_kwargs
+            )
             prompt_time = time.perf_counter() - tic
             prompt_tps = prompt.size / prompt_time
-            generated_tokens = output_sequence[0, prompt.size:]
-            generated_text = tokenizer.decode(generated_tokens.tolist(), skip_special_tokens=True)
+            generated_tokens = output_sequence[0, prompt.size :]
+            generated_text = tokenizer.decode(
+                generated_tokens.tolist(), skip_special_tokens=True
+            )
             yield GenerationResponse(
                 text=generated_text,
-                token=generated_tokens[-1].item() if generated_tokens.size > 0 else None,
+                token=(
+                    generated_tokens[-1].item() if generated_tokens.size > 0 else None
+                ),
                 logprobs=mx.array([]),
                 prompt_tokens=prompt.size,
                 prompt_tps=prompt_tps,
@@ -737,7 +779,9 @@ def stream_generate(
             token_generator = generate_step(prompt, model, **kwargs)
         else:
             kwargs.pop("max_kv_size", None)
-            token_generator = speculative_generate_step(prompt, model, draft_model, **kwargs)
+            token_generator = speculative_generate_step(
+                prompt, model, draft_model, **kwargs
+            )
         with wired_limit(model, [generation_stream]):
             detokenizer.reset()
             tic = time.perf_counter()
@@ -803,7 +847,7 @@ def generate(
         print("=" * 10)
 
     text = ""
-    for response in stream_generate(model, tokenizer, prompt, verbose=verbose, **kwargs):
+    for response in stream_generate(model, tokenizer, prompt, **kwargs):
         if verbose:
             print(response.text, end="", flush=True)
         text += response.text
@@ -813,16 +857,16 @@ def generate(
         print("=" * 10)
         if len(text) == 0:
             print("No text generated for this prompt")
-        else:
-            print(
-                f"Prompt: {response.prompt_tokens} tokens, "
-                f"{response.prompt_tps:.3f} tokens-per-sec"
-            )
-            print(
-                f"Generation: {response.generation_tokens} tokens, "
-                f"{response.generation_tps:.3f} tokens-per-sec"
-            )
-            print(f"Peak memory: {response.peak_memory:.3f} GB")
+            return
+        print(
+            f"Prompt: {response.prompt_tokens} tokens, "
+            f"{response.prompt_tps:.3f} tokens-per-sec"
+        )
+        print(
+            f"Generation: {response.generation_tokens} tokens, "
+            f"{response.generation_tps:.3f} tokens-per-sec"
+        )
+        print(f"Peak memory: {response.peak_memory:.3f} GB")
     return text
 
 
@@ -867,8 +911,11 @@ def load_model(
     config.update(model_config)
 
     weight_files = glob.glob(str(model_path / "model*.safetensors"))
+
     if not weight_files:
+        # Try weight for back-compat
         weight_files = glob.glob(str(model_path / "weight*.safetensors"))
+
     if not weight_files:
         logging.error(f"No safetensors found in {model_path}")
         raise FileNotFoundError(f"No safetensors found in {model_path}")
@@ -877,22 +924,23 @@ def load_model(
     for wf in weight_files:
         weights.update(mx.load(wf))
 
-
     model_class, model_args_class = get_model_classes(config=config)
+
     model_args = model_args_class.from_dict(config)
     model = model_class(model_args)
-
-    param_dict = model.parameters()
 
     if hasattr(model, "sanitize"):
         weights = model.sanitize(weights)
 
     if (quantization := config.get("quantization", None)) is not None:
+
         def class_predicate(p, m):
+            # Handle custom per layer quantizations
             if p in config["quantization"]:
                 return config["quantization"][p]
             if not hasattr(m, "to_quantized"):
                 return False
+            # Handle legacy models which may not have everything quantized
             return f"{p}.scales" in weights
 
         nn.quantize(
@@ -909,6 +957,7 @@ def load_model(
 
     model.eval()
     return model, config
+
 
 def load(
     path_or_hf_repo: str,

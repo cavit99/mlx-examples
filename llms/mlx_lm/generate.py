@@ -16,15 +16,17 @@ DEFAULT_TEMP = 0.0
 DEFAULT_TOP_P = 1.0
 DEFAULT_MIN_P = 0.0
 DEFAULT_MIN_TOKENS_TO_KEEP = 1
-DEFAULT_SEED = 0
+DEFAULT_SEED = None
 DEFAULT_MODEL = "mlx-community/Llama-3.2-3B-Instruct-4bit"
 DEFAULT_QUANTIZED_KV_START = 5000
 
 # Diffusion model specific parameters
+DEFAULT_DIFFUSION_SEED = None
 DEFAULT_STEPS = 32
 DEFAULT_GEN_LENGTH = 64
 DEFAULT_NOISE_TEMPERATURE = 0.0
 DEFAULT_CFG_SCALE = 0.0
+
 
 def str2bool(string):
     return string.lower() not in ["false", "f"]
@@ -87,11 +89,22 @@ def setup_arg_parser():
         default=DEFAULT_MIN_TOKENS_TO_KEEP,
         help="Minimum tokens to keep for min-p sampling.",
     )
-    parser.add_argument("--seed", type=int, default=DEFAULT_SEED, help="PRNG seed")
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=DEFAULT_SEED,
+        help="PRNG seed (default: use MLX's time-based RNG)",
+    )
     parser.add_argument(
         "--ignore-chat-template",
         action="store_true",
         help="Use the raw prompt without the tokenizer's chat template.",
+    )
+    parser.add_argument(
+        "--diffusion-seed",
+        type=int,
+        default=DEFAULT_DIFFUSION_SEED,
+        help="Seed for diffusion generation. Omit for stochastic outputs, or specify for reproducibility (e.g., 42).",
     )
     parser.add_argument(
         "--use-default-chat-template",
@@ -161,7 +174,7 @@ def setup_arg_parser():
         help="Length of generated sequence (default: 64)",
     )
     parser.add_argument(
-        "--noise-temperature",
+        "--noise-temp",
         type=float,
         default=DEFAULT_NOISE_TEMPERATURE,
         help="Temperature for Gumbel noise in diffusion sampling (default: 0.0)",
@@ -179,7 +192,8 @@ def main():
     parser = setup_arg_parser()
     args = parser.parse_args()
 
-    mx.random.seed(args.seed)
+    if args.seed is not None:
+        mx.random.seed(args.seed)
 
     # Load the prompt cache and metadata if a cache file is provided
     using_cache = args.prompt_cache_file is not None
@@ -269,24 +283,23 @@ def main():
         # LLaDA-specific generation
 
         gen_kwargs = {
+            "diffusion_seed": args.diffusion_seed,
             "steps": args.steps,
             "gen_length": args.gen_length,
-            "noise_temperature": args.noise_temperature,
+            "noise_temp": args.noise_temp,
             "cfg_scale": args.cfg_scale,
         }
         if using_cache:
             raise ValueError("Prompt cache is not supported for LLaDA models.")
-        
+
         response = generate(
-            model,
-            tokenizer,
-            prompt,
-            verbose=args.verbose,
-             **gen_kwargs
+            model, tokenizer, prompt, verbose=args.verbose, **gen_kwargs
         )
     else:
         # Autoregressive generation
-        sampler = make_sampler(args.temp, args.top_p, args.min_p, args.min_tokens_to_keep)
+        sampler = make_sampler(
+            args.temp, args.top_p, args.min_p, args.min_tokens_to_keep
+        )
         response = generate(
             model,
             tokenizer,
