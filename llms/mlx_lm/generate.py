@@ -8,7 +8,7 @@ import mlx.core as mx
 
 from .models.cache import QuantizedKVCache, load_prompt_cache
 from .sample_utils import make_sampler
-from .utils import generate, load
+from .utils import diffusion_generate, generate, load
 
 DEFAULT_PROMPT = "hello"
 DEFAULT_MAX_TOKENS = 100
@@ -21,7 +21,6 @@ DEFAULT_MODEL = "mlx-community/Llama-3.2-3B-Instruct-4bit"
 DEFAULT_QUANTIZED_KV_START = 5000
 
 # Diffusion model specific parameters
-DEFAULT_DIFFUSION_SEED = None
 DEFAULT_STEPS = 32
 DEFAULT_GEN_LENGTH = 64
 DEFAULT_NOISE_TEMPERATURE = 0.0
@@ -101,12 +100,6 @@ def setup_arg_parser():
         help="Use the raw prompt without the tokenizer's chat template.",
     )
     parser.add_argument(
-        "--diffusion-seed",
-        type=int,
-        default=DEFAULT_DIFFUSION_SEED,
-        help="Seed for diffusion generation. Omit for stochastic outputs, or specify for reproducibility (e.g., 42).",
-    )
-    parser.add_argument(
         "--use-default-chat-template",
         action="store_true",
         help="Use the default chat template",
@@ -180,10 +173,16 @@ def setup_arg_parser():
         help="Temperature for Gumbel noise in diffusion sampling (default: 0.0)",
     )
     parser.add_argument(
-        "--cfg-scale",
+        "--cfg",
         type=float,
         default=DEFAULT_CFG_SCALE,
-        help="Classifier-free guidance scale (default: 0.0)",
+        help="Classifier-free guidance (CFG) scale (default: 0.0)",
+    )
+    parser.add_argument(
+        "--block-length",
+        type=int,
+        default=None,
+        help="Length of semi-autoregressive blocks for diffusion generation (default: match gen-length)",
     )
     return parser
 
@@ -279,21 +278,26 @@ def main():
 
     # Determine model type and generate accordingly
     model_type = getattr(model.args, "model_type", None)
-    if model_type == "llada":
-        # LLaDA-specific generation
 
-        gen_kwargs = {
-            "diffusion_seed": args.diffusion_seed,
-            "steps": args.steps,
-            "gen_length": args.gen_length,
-            "noise_temp": args.noise_temp,
-            "cfg_scale": args.cfg_scale,
-        }
+    if model_type == "llada":
+        # LLaDA-specific diffusion generation
         if using_cache:
             raise ValueError("Prompt cache is not supported for LLaDA models.")
 
-        response = generate(
-            model, tokenizer, prompt, verbose=args.verbose, **gen_kwargs
+        # Convert prompt from list to mx.array
+        prompt = mx.array(prompt)
+
+        response = diffusion_generate(
+            prompt,
+            model,
+            tokenizer,
+            steps=args.steps,
+            gen_length=args.gen_length,
+            block_length=args.block_length,
+            noise_temp=args.noise_temp,
+            cfg=args.cfg,
+            diffusion_seed=args.seed,
+            verbose=args.verbose,
         )
     else:
         # Autoregressive generation
@@ -316,8 +320,10 @@ def main():
             num_draft_tokens=args.num_draft_tokens,
         )
 
-    if not args.verbose:
-        print(response)
+        # For autoregressive models, print the response if not verbose
+        # (verbose=True is already handled inside generate())
+        if not args.verbose:
+            print(response)
 
 
 if __name__ == "__main__":
