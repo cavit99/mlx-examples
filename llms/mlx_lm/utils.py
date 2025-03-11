@@ -223,121 +223,111 @@ def diffusion_generate(
     mask_token_id: int = None,
     verbose: bool = False,
     diffusion_seed: Optional[int] = None,
-) -> mx.array:
+    remasking: str = "low_confidence",
+) -> Tuple[mx.array, str]:
     """
-    Generate text using a diffusion-based approach with stabilized Gumbel noise and low-confidence remasking.
+    Generate text using a diffusion-based approach with stabilized Gumbel noise in probability space.
 
     Args:
         prompt (mx.array): Input prompt tensor.
         model (nn.Module): LLaDA model.
         tokenizer: Tokenizer instance.
-        steps (int): Number of diffusion steps.
+        steps (int): Total number of diffusion steps across all blocks.
         gen_length (int): Length of generated sequence.
-        block_length (int, optional): Length of semi-autoregressive blocks. If None, uses full gen_length.
-        noise_temp (float): Temperature for Gumbel noise, controlling sharpness.
+        block_length (int, optional): Length of each block. If None, defaults to gen_length.
+        noise_temp (float): Temperature for Gumbel noise exponent, controlling randomness.
         cfg (float): Classifier-free guidance scale.
         mask_token_id (int, optional): ID for [MASK] token.
         verbose (bool): Print debug information.
         diffusion_seed (Optional[int]): Seed for diffusion process randomness.
+        remasking (str): Remasking strategy, either 'low_confidence' or 'random'.
 
     Returns:
-        mx.array: Generated token sequence.
+        Tuple[mx.array, str]: Generated token sequence and decoded text.
     """
-    # Default mask token ID from model if not provided
+
+    # Stabilized Gumbel noise base
+    def stabilized_gumbel(key, shape):
+        uniform = mx.random.uniform(
+            low=1e-7, high=1 - 1e-7, shape=shape, dtype=mx.float32, key=key
+        )
+        return -mx.log(uniform)
+
+    # Gumbel sampling in probability space
+    def gumbel_argmax(logits, temp, key):
+        if temp <= 0.0:
+            probs = mx.softmax(logits, axis=-1)
+            return mx.argmax(probs, axis=-1)
+        gumbel_noise = stabilized_gumbel(key, logits.shape) ** temp
+        logits = logits - mx.max(logits, axis=-1, keepdims=True)  # Prevent overflow
+        probs = mx.exp(logits)
+        noisy_probs = probs / gumbel_noise
+        return mx.argmax(noisy_probs, axis=-1)
+
+    # Default mask token ID
     mask_token_id = mask_token_id or getattr(model.args, "mask_token_id", 126336)
     batch_size = 1
     prompt_length = prompt.shape[0]
     seq_len = prompt_length + gen_length
 
-    # If block_length is None, use full gen_length (non-block mode)
+    # Block setup
     block_length = block_length or gen_length
-
-    # Calculate number of blocks
-    num_blocks = (gen_length + block_length - 1) // block_length  # Ceiling division
+    num_blocks = (gen_length + block_length - 1) // block_length
+    block_sizes = [
+        min(block_length, gen_length - i * block_length) for i in range(num_blocks)
+    ]
+    base_steps = steps // num_blocks
+    remainder = steps % num_blocks
+    steps_per_block = [
+        base_steps + 1 if i < remainder else base_steps for i in range(num_blocks)
+    ]
 
     if verbose:
-        print(f"Generating with diffusion model: {steps} steps, {gen_length} tokens")
+        print(
+            f"Steps: {steps}, Gen Length: {gen_length}, Blocks: {block_sizes}, Steps per Block: {steps_per_block}"
+        )
 
-    # Initialize sequence with prompt and [MASK] tokens
+    # Initialize sequence
     x = mx.full((batch_size, seq_len), mask_token_id, dtype=prompt.dtype)
     x[:, :prompt_length] = prompt
-    mx.eval(x)  # Resolve initial array
-
-    # Full-attention mask (zeros allow attention to all positions)
     mask = mx.zeros((1, 1, seq_len, seq_len), dtype=x.dtype)
+    mx.eval(x)
 
-    # Initialize PRNG with seed parameter or time-based fallback
+    # PRNG setup
     if diffusion_seed is None:
         diffusion_seed = int(time.time_ns())
     master_key = mx.random.key(diffusion_seed)
-    # Create separate keys for each block
     block_keys = mx.random.split(master_key, num_blocks)
 
-    # Stabilized Gumbel noise function
-    def stabilized_gumbel(key, shape):
-        uniform = mx.random.uniform(
-            low=1e-7, high=1 - 1e-7, shape=shape, dtype=mx.float32, key=key
-        )
-        return -mx.log(-mx.log(uniform))
+    # Block processing
+    for block_idx, (block_size, block_steps) in enumerate(
+        zip(block_sizes, steps_per_block)
+    ):
+        if verbose and block_idx > 0:
+            print(f"\n--- Block {block_idx + 1}/{num_blocks} ---")
 
-    # Gumbel sampling with temperature scaling
-    def gumbel_argmax(logits, temp, key):
-        if temp <= 0.0:
-            probs = mx.softmax(logits, axis=-1)
-            return mx.argmax(probs, axis=-1)
-        gumbel_noise = stabilized_gumbel(key, logits.shape)
-        scaled_logits = (logits + gumbel_noise) / temp
-        return mx.argmax(scaled_logits, axis=-1)
+        block_start = prompt_length + sum(block_sizes[:block_idx])
+        block_end = block_start + block_size
+        seq_indices = mx.arange(seq_len, dtype=mx.int32)
+        block_mask = (seq_indices >= block_start) & (seq_indices < block_end)
+        prompt_mask = seq_indices < prompt_length
+        block_mask, prompt_mask = block_mask[None, :], prompt_mask[None, :]
 
-    # Process each block sequentially
-    total_steps_used = 0
-    for block_idx in range(num_blocks):
-        if verbose:
-            # Print a simple header for each block if this is not the first block
-            if block_idx > 0:
-                print("\n--- Block %d/%d ---" % (block_idx + 1, num_blocks))
-
-        # Calculate block boundaries
-        block_start = prompt_length + block_idx * block_length
-        block_end = min(prompt_length + (block_idx + 1) * block_length, seq_len)
-        block_size = block_end - block_start
-
-        # Allocate steps proportionally to block size, ensuring all steps are used
-        steps_per_block = (steps * block_size + gen_length - 1) // gen_length
-        if block_idx == num_blocks - 1:
-            steps_per_block = (
-                steps - total_steps_used
-            )  # Use remaining steps for last block
-        total_steps_used += steps_per_block
-
-        # Create step keys for this block
-        step_keys = mx.random.split(block_keys[block_idx], steps_per_block)
-
-        # Create timesteps for this block
-        timesteps = mx.linspace(1.0, 0.0, steps_per_block + 1)[:-1]
-
-        # Precompute prompt and block masks for CFG and unmasking
-        block_mask = (mx.arange(seq_len) >= block_start) & (
-            mx.arange(seq_len) < block_end
-        )
-        prompt_mask = mx.arange(seq_len) < prompt_length
-        block_mask = block_mask[None, :]  # Shape: [1, seq_len]
-        prompt_mask = prompt_mask[None, :]  # Shape: [1, seq_len]
+        timesteps = mx.linspace(1.0, 0.0, block_steps)  # Include 0.0
+        step_keys = mx.random.split(block_keys[block_idx], block_steps)
 
         for step, t in enumerate(timesteps):
-            # Compute current mask condition within the block
             mask_condition = x == mask_token_id
             block_mask_condition = mask_condition & block_mask
-
             num_masks_in_block = int(mx.sum(block_mask_condition).item())
-            current_unmasked_in_block = int(mx.sum(~mask_condition & block_mask).item())
-
             if num_masks_in_block == 0:
                 if verbose:
-                    print(f"Block {block_idx + 1} fully unmasked at step {step + 1}")
+                    print(
+                        f"Block {block_idx + 1} fully unmasked at step {step + 1}/{block_steps}"
+                    )
                 break
 
-            # CFG implementation (full sequence for bidirectional context)
+            # CFG and logits
             if cfg > 0.0:
                 un_x = mx.where(prompt_mask, mask_token_id, x)
                 x_ = mx.concatenate([x, un_x], axis=0)
@@ -346,103 +336,79 @@ def diffusion_generate(
                 logits = un_logits + (cfg + 1) * (logits - un_logits)
             else:
                 logits = model(x, mask=mask)
-            mx.eval(logits)  # Resolve logits
+            mx.eval(logits)
 
-            # Sample predictions with Gumbel noise
-            x0 = gumbel_argmax(logits, noise_temp, step_keys[step])
+            # Sampling
+            step_key = step_keys[step]
+            x0 = gumbel_argmax(logits, noise_temp, step_key)
 
-            # Compute confidence scores
-            probs = mx.softmax(logits, axis=-1)
-            confidence_scores = mx.max(probs, axis=-1)  # Shape: [1, seq_len]
+            # Compute confidence scores based on remasking strategy
+            if remasking == "low_confidence":
+                if noise_temp > 0.0:
+                    gumbel_noise = (
+                        stabilized_gumbel(step_key, logits.shape) ** noise_temp
+                    )
+                    logits_shifted = logits - mx.max(logits, axis=-1, keepdims=True)
+                    noisy_probs = mx.exp(logits_shifted) / gumbel_noise
+                    confidence_scores = mx.max(noisy_probs, axis=-1)
+                else:
+                    probs = mx.softmax(logits, axis=-1)
+                    confidence_scores = mx.max(probs, axis=-1)
+            elif remasking == "random":
+                confidence_scores = mx.random.uniform(
+                    shape=(batch_size, seq_len), key=step_key
+                )
 
-            # Mask confidences for positions outside current block or already unmasked
-            masked_confidences = mx.where(
-                block_mask_condition,
-                confidence_scores,
-                mx.full(confidence_scores.shape, -1e9, dtype=confidence_scores.dtype),
-            )
+            # Apply confidence scores only to masked tokens in the current block
+            masked_confidences = mx.where(block_mask_condition, confidence_scores, -1e9)
 
-            # Calculate target unmasked tokens for next timestep in this block
-            s = t - 1.0 / steps_per_block if step < steps_per_block - 1 else 0
-            n_un = int(
-                mx.round(block_size * (1 - s)).item()
-            )  # Target unmasked tokens in block
-            tokens_to_unmask = int(
-                mx.maximum(0, n_un - current_unmasked_in_block).item()
-            )
+            target_unmasked = int(mx.round(block_size * (1 - t)).item())
+            current_unmasked = block_size - num_masks_in_block
 
-            if tokens_to_unmask > 0 and num_masks_in_block > 0:
-                # Unmask only within the current block
+            # Force full unmasking on last step
+            if step == block_steps - 1:
+                num_to_unmask = num_masks_in_block
+            else:
+                num_to_unmask = min(
+                    max(0, target_unmasked - current_unmasked), num_masks_in_block
+                )
+
+            if num_to_unmask > 0:
                 flat_confidences = masked_confidences.flatten()
-                sorted_indices = mx.argsort(flat_confidences)[::-1]  # High to low
-                num_to_unmask = int(min(tokens_to_unmask, num_masks_in_block))
-
-                # Unmasking
+                sorted_indices = mx.argsort(flat_confidences)[::-1]  # Descending order
                 unmask_indices = mx.take(
                     sorted_indices, mx.arange(num_to_unmask, dtype=mx.int32)
                 )
                 unmask_mask = mx.zeros((batch_size, seq_len), dtype=mx.bool_)
                 unmask_mask[:, unmask_indices] = True
                 x = mx.where(unmask_mask & block_mask_condition, x0, x)
-
-            mx.eval(x)
+                mx.eval(x)
 
             if verbose:
-                # Get the response part of the sequence up to current block
                 response_tokens = x[0, prompt_length:block_end].tolist()
-
                 try:
-                    # Decode the sequence with skip_special_tokens=True to ignore mask tokens
                     current_text = tokenizer.decode(
                         response_tokens, skip_special_tokens=True
                     )
-
-                    # Count how many masks remain in current block
                     mask_count = response_tokens.count(mask_token_id)
                     total_tokens = len(response_tokens)
-
-                    # Show current text and mask count with step number
-                    if current_text.strip():
-                        output_line = current_text
-                    else:
-                        output_line = "(No text revealed yet)"
-
-                    if mask_count != 0:
+                    output_line = current_text.strip() or "(No text revealed yet)"
+                    if mask_count > 0:
                         output_line += f" \n\n[{mask_count}/{total_tokens} masked]"
-
-                    # Clear the screen and move cursor to top-left
                     print("\033[2J\033[H", end="", flush=True)
-
-                    # Reprint the header and current output
                     print(
                         f"Generating with diffusion model: {steps} steps, {gen_length} tokens\n\n"
                     )
+                    print(
+                        f"Block {block_idx + 1}/{num_blocks}, Step {step + 1}/{block_steps}:"
+                    )
                     print(output_line)
                 except Exception as e:
-                    # Clear screen and show error
-                    print("\033[2J\033[H", end="", flush=True)
-                    print(
-                        f"Generating with diffusion model: {steps} steps, {gen_length} tokens"
-                    )
                     print(f"Error displaying progress at step {step}: {e}")
 
-        if not verbose:
-            pass
-        else:
-            # Add a newline after each block in verbose mode
-            print()
-
-            # Only print block transition in verbose mode
-            if block_idx < num_blocks - 1:
-                print(f"\n--- Moving to next block ({block_idx+2}/{num_blocks}) ---\n")
-
-    # Print final output
     final_text = tokenizer.decode(
-        x[0, prompt_length:].tolist(),
-        skip_special_tokens=True,
-        clean_up_tokenization_spaces=True,
+        x[0, prompt_length:].tolist(), skip_special_tokens=True
     )
-
     return x, final_text
 
 
@@ -914,17 +880,12 @@ def generate(
         )
         peak_memory = mx.metal.get_peak_memory() / 1e9
 
-        # Output based on verbose flag
-        if verbose:
-            print(final_text)
-            print("\n" + "=" * 10)
-            print(f"Prompt: {prompt_tokens} tokens")
-            print(
-                f"Generation: {generation_tokens} tokens, {generation_tps:.3f} tokens-per-sec"
-            )
-            print(f"Peak memory: {peak_memory:.3f} GB")
-        else:
-            print(final_text)
+        print("\n" + "=" * 10)
+        print(f"Prompt: {prompt_tokens} tokens")
+        print(
+            f"Generation: {generation_tokens} tokens, {generation_tps:.3f} tokens-per-sec"
+        )
+        print(f"Peak memory: {peak_memory:.3f} GB")
 
         return final_text
     else:

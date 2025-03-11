@@ -9,7 +9,7 @@ import mlx.core as mx
 
 from .models.cache import QuantizedKVCache, load_prompt_cache
 from .sample_utils import make_sampler
-from .utils import diffusion_generate, generate, load
+from .utils import generate, load
 
 DEFAULT_PROMPT = "hello"
 DEFAULT_MAX_TOKENS = 100
@@ -26,6 +26,7 @@ DEFAULT_STEPS = 32
 DEFAULT_GEN_LENGTH = 64
 DEFAULT_NOISE_TEMPERATURE = 0.0
 DEFAULT_CFG_SCALE = 0.0
+DEFAULT_REMASKING = "low_confidence"
 
 
 def str2bool(string):
@@ -185,6 +186,12 @@ def setup_arg_parser():
         default=None,
         help="Length of semi-autoregressive blocks for diffusion generation (default: match gen-length)",
     )
+    parser.add_argument(
+        "--remasking",
+        type=str,
+        default=DEFAULT_REMASKING,
+        help="Remasking strategy (default: 'low_confidence')",
+    )
     return parser
 
 
@@ -289,7 +296,7 @@ def main():
             "block_length": args.block_length,
             "noise_temp": args.noise_temp,
             "cfg": args.cfg,
-            "diffusion_seed": args.seed,
+            "remasking": args.remasking,
         }
     else:
         generation_args = {
