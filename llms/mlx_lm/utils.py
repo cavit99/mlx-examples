@@ -312,6 +312,10 @@ def generate_diffusion(
     master_key = mx.random.key(seed)
     block_keys = mx.random.split(master_key, num_blocks)
 
+    # Pre-allocate index_buffer (NEW)
+    max_unmask = max(block_sizes)
+    index_buffer = mx.arange(max_unmask, dtype=mx.int32)
+
     # Block processing
     for block_idx, (block_size, block_steps) in enumerate(
         zip(block_sizes, steps_per_block)
@@ -383,7 +387,7 @@ def generate_diffusion(
             if num_to_unmask > 0:
                 unmask_indices = mx.take(
                     mx.argsort(masked_confidences.flatten())[::-1],
-                    mx.arange(num_to_unmask, dtype=mx.int32),
+                    index_buffer[:num_to_unmask],
                 )
                 x[:, unmask_indices] = x0[:, unmask_indices]
 
@@ -403,7 +407,7 @@ def generate_diffusion(
                         f"Generating with diffusion model: {steps} steps, {gen_length} tokens\n"
                     )
                     print(
-                        f"Block {block_idx + 1}/{num_blocks}, Step {step + 1}/{block_steps}, {unmasked_count}/{total_tokens} Unmasked:\n"
+                        f"Block {block_idx + 1}/{num_blocks} | Step {step + 1}/{block_steps} | Unmasked {unmasked_count}/{total_tokens}\n"
                     )
                     print(output_line)
                 except Exception as e:
@@ -418,8 +422,6 @@ def generate_diffusion(
     final_text = tokenizer.decode(
         x[0, prompt_length:].tolist(), skip_special_tokens=True
     )
-    if not verbose:
-        print(final_text)
     return x, final_text
 
 
