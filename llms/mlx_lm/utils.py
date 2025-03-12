@@ -246,25 +246,35 @@ def generate_diffusion(
         Tuple[mx.array, str]: Generated token sequence and decoded text.
     """
 
-    # Stabilized Gumbel noise base
     @mx.compile
     def generate_stabilized_gumbel_noise(key, shape):
-        """Generate stabilized Gumbel noise from a uniform distribution with bounded values."""
+        """
+        Generate stabilized Gumbel noise from a uniform distribution
+        with bounded values as base for diffusion
+        """
         uniform = mx.random.uniform(
             low=1e-7, high=1 - 1e-7, shape=shape, dtype=mx.float32, key=key
         )
         return -mx.log(uniform)
 
-    # Gumbel sampling in probability space
     @mx.compile
     def sample_gumbel_or_softmax(logits, temp, key):
-        """Sample token indices from logits using Gumbel noise or softmax based on temperature."""
+        """
+        Sample token indices from logits using Gumbel noise or softmax
+        based on temperature in probably space"""
         logits = logits - mx.max(logits, axis=-1, keepdims=True)  # Stabilize
         probs = mx.softmax(logits, axis=-1)
         gumbel_noise = generate_stabilized_gumbel_noise(key, logits.shape) ** temp
         noisy_probs = mx.where(temp > 0.0, probs / gumbel_noise, probs)
         sampled_ids = mx.argmax(noisy_probs, axis=-1)
         return sampled_ids, gumbel_noise
+
+    # Model dtype handling
+    model_dtype = (
+        mx.float16
+        if hasattr(model, "dtype") and model.dtype == mx.float16
+        else mx.float32
+    )
 
     # Default mask token ID
     mask_token_id = mask_token_id or getattr(model.args, "mask_token_id", 126336)
@@ -292,7 +302,9 @@ def generate_diffusion(
     # Initialize sequence
     x = mx.full((batch_size, seq_len), mask_token_id, dtype=prompt.dtype)
     x[:, :prompt_length] = prompt
-    mask = mx.zeros((1, 1, seq_len, seq_len), dtype=x.dtype)
+    mask = mx.zeros(
+        (1, 1, seq_len, seq_len), dtype=mx.float16
+    )  # Fixed: Use float16 for mask
 
     # PRNG setup
     if seed is None:
@@ -310,18 +322,15 @@ def generate_diffusion(
         block_start = prompt_length + sum(block_sizes[:block_idx])
         block_end = block_start + block_size
         seq_indices = mx.arange(seq_len, dtype=mx.int32)
-        block_mask = (seq_indices >= block_start) & (seq_indices < block_end)
-        prompt_mask = seq_indices < prompt_length
-        block_mask, prompt_mask = block_mask[None, :], prompt_mask[None, :]
+        block_mask = (seq_indices >= block_start) & (seq_indices < block_end)[None, :]
 
-        timesteps = mx.linspace(1.0, 0.0, block_steps)
+        timesteps = mx.linspace(1.0, 0.0, block_steps, dtype=mx.float32)
         step_keys = mx.random.split(block_keys[block_idx], block_steps)
 
         for step, t in enumerate(timesteps):
             mask_condition = x == mask_token_id
             block_mask_condition = mask_condition & block_mask
             num_masks_in_block = int(mx.sum(block_mask_condition).item())
-            mx.eval(block_mask_condition)
 
             if num_masks_in_block == 0:
                 if verbose:
@@ -330,21 +339,23 @@ def generate_diffusion(
                     )
                 break
 
-            # CFG and logits
+            # CFG (Classifier-free guidance) and logits
             if cfg > 0.0:
-                un_x = mx.where(prompt_mask, mask_token_id, x)
-                x_ = mx.concatenate([x, un_x], axis=0)
-                logits = model(x_, mask=mask)
+                un_x = mx.full(x.shape, mask_token_id, dtype=x.dtype)
+                un_x[:, :prompt_length] = prompt
+                x_ = mx.concatenate([x, un_x], axis=0)  # Shape: (2, seq_len)
+                logits = model(x_, mask=mask).astype(model_dtype)
                 logits, un_logits = mx.split(logits, 2, axis=0)
                 logits = un_logits + (cfg + 1) * (logits - un_logits)
             else:
-                logits = model(x, mask=mask)
+                logits = model(x, mask=mask).astype(model_dtype)
 
             # Sampling
-            step_key = step_keys[step]
-            x0, gumbel_noise = sample_gumbel_or_softmax(logits, noise_temp, step_key)
+            x0, gumbel_noise = sample_gumbel_or_softmax(
+                logits, noise_temp, step_keys[step]
+            )
 
-            # Lazily compute confidence scores for fusion
+            # Confidence scores
             if remasking == "low_confidence":
                 if noise_temp > 0.0:
                     confidence_scores = mx.max(
@@ -356,33 +367,25 @@ def generate_diffusion(
                     confidence_scores = mx.max(mx.softmax(logits, axis=-1), axis=-1)
             elif remasking == "random":
                 confidence_scores = mx.random.uniform(
-                    shape=(batch_size, seq_len), key=step_key
+                    shape=(batch_size, seq_len), key=step_keys[step], dtype=model_dtype
                 )
 
-            # Apply confidence scores only to masked tokens in the current block
+            # Unmasking
             masked_confidences = mx.where(block_mask_condition, confidence_scores, -1e9)
             target_unmasked = int(mx.round(block_size * (1 - t)).item())
-            mx.eval(t)
             current_unmasked = block_size - num_masks_in_block
-
-            # Force full unmasking on last step
-            if step == block_steps - 1:
-                num_to_unmask = num_masks_in_block
-            else:
-                num_to_unmask = min(
-                    max(0, target_unmasked - current_unmasked), num_masks_in_block
-                )
+            num_to_unmask = (
+                num_masks_in_block
+                if step == block_steps - 1
+                else min(max(0, target_unmasked - current_unmasked), num_masks_in_block)
+            )
 
             if num_to_unmask > 0:
-                flat_confidences = masked_confidences.flatten()
-                sorted_indices = mx.argsort(flat_confidences)[::-1]
                 unmask_indices = mx.take(
-                    sorted_indices, mx.arange(num_to_unmask, dtype=mx.int32)
+                    mx.argsort(masked_confidences.flatten())[::-1],
+                    mx.arange(num_to_unmask, dtype=mx.int32),
                 )
-                mx.eval(unmask_indices)
-                unmask_mask = mx.zeros((batch_size, seq_len), dtype=mx.bool_)
-                unmask_mask[:, unmask_indices] = True
-                x = mx.where(unmask_mask & block_mask_condition, x0, x)
+                x[:, unmask_indices] = x0[:, unmask_indices]
 
             if verbose:
                 mx.eval(x)
@@ -393,27 +396,30 @@ def generate_diffusion(
                     )
                     mask_count = response_tokens.count(mask_token_id)
                     total_tokens = len(response_tokens)
+                    unmasked_count = total_tokens - mask_count
                     output_line = current_text.strip() or "(No text revealed yet)"
-                    if mask_count > 0:
-                        output_line += f" [{mask_count}/{total_tokens} masked]"
+                    print("\033[2J\033[H", end="", flush=True)
                     print(
-                        f"\rBlock {block_idx + 1}/{num_blocks}, Step {step + 1}/{block_steps}: {output_line:<80}",
-                        end="",
-                        flush=True,
+                        f"Generating with diffusion model: {steps} steps, {gen_length} tokens\n"
                     )
+                    print(
+                        f"Block {block_idx + 1}/{num_blocks}, Step {step + 1}/{block_steps}, {unmasked_count}/{total_tokens} Unmasked:\n"
+                    )
+                    print(output_line)
                 except Exception as e:
-                    print(
-                        f"\rError displaying progress at step {step}: {e}",
-                        end="",
-                        flush=True,
-                    )
-            if verbose and step == block_steps - 1:
-                print()  # Newline after block completes
+                    print("\033[2J\033[H", end="", flush=True)
+                    print(f"Error displaying progress at step {step}: {e}")
 
+        if verbose and num_masks_in_block > 0:
+            print()
+
+    # Final evaluation and output
     mx.eval(x)
     final_text = tokenizer.decode(
         x[0, prompt_length:].tolist(), skip_special_tokens=True
     )
+    if not verbose:
+        print(final_text)
     return x, final_text
 
 
@@ -832,6 +838,7 @@ def generate(
             ]
             if k in kwargs
         }
+        diffusion_args["verbose"] = verbose  # Ensure verbose is set
         output_sequence, text = generate_diffusion(
             prompt, model, tokenizer, **diffusion_args
         )
