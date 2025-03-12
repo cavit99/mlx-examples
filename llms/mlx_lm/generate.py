@@ -3,7 +3,6 @@
 import argparse
 import json
 import sys
-import time
 
 import mlx.core as mx
 
@@ -20,13 +19,13 @@ DEFAULT_MIN_TOKENS_TO_KEEP = 1
 DEFAULT_SEED = None
 DEFAULT_MODEL = "mlx-community/Llama-3.2-3B-Instruct-4bit"
 DEFAULT_QUANTIZED_KV_START = 5000
-
-# Diffusion model specific parameters
+# Diffusion-specific defaults
 DEFAULT_STEPS = 32
 DEFAULT_GEN_LENGTH = 64
-DEFAULT_NOISE_TEMPERATURE = 0.0
-DEFAULT_CFG_SCALE = 0.0
+DEFAULT_NOISE_TEMP = 0.0
+DEFAULT_CFG = 0.0
 DEFAULT_REMASKING = "low_confidence"
+DEFAULT_BLOCK_LENGTH = None
 
 
 def str2bool(string):
@@ -90,12 +89,7 @@ def setup_arg_parser():
         default=DEFAULT_MIN_TOKENS_TO_KEEP,
         help="Minimum tokens to keep for min-p sampling.",
     )
-    parser.add_argument(
-        "--seed",
-        type=int,
-        default=DEFAULT_SEED,
-        help="PRNG seed (default: use MLX's time-based RNG)",
-    )
+    parser.add_argument("--seed", type=int, default=DEFAULT_SEED, help="PRNG seed")
     parser.add_argument(
         "--ignore-chat-template",
         action="store_true",
@@ -156,41 +150,43 @@ def setup_arg_parser():
         help="Number of tokens to draft when using speculative decoding.",
         default=2,
     )
+
+    # Diffusion-specific arguments
     parser.add_argument(
         "--steps",
         type=int,
         default=DEFAULT_STEPS,
-        help="Number of diffusion steps (default: 32)",
+        help="Number of diffusion steps",
     )
     parser.add_argument(
         "--gen-length",
         type=int,
         default=DEFAULT_GEN_LENGTH,
-        help="Length of generated sequence (default: 64)",
+        help="Length of generated sequence",
     )
     parser.add_argument(
         "--noise-temp",
         type=float,
-        default=DEFAULT_NOISE_TEMPERATURE,
-        help="Temperature for Gumbel noise in diffusion sampling (default: 0.0)",
+        default=DEFAULT_NOISE_TEMP,
+        help="Temperature for Gumbel noise in diffusion sampling",
     )
     parser.add_argument(
         "--cfg",
         type=float,
-        default=DEFAULT_CFG_SCALE,
-        help="Classifier-free guidance (CFG) scale (default: 0.0)",
+        default=DEFAULT_CFG,
+        help="Classifier-Free Guidance scale",
     )
     parser.add_argument(
         "--block-length",
         type=int,
-        default=None,
-        help="Length of semi-autoregressive blocks for diffusion generation (default: match gen-length)",
+        default=DEFAULT_BLOCK_LENGTH,
+        help="Length of semi-autoregressive blocks for diffusion",
     )
     parser.add_argument(
         "--remasking",
         type=str,
         default=DEFAULT_REMASKING,
-        help="Remasking strategy (default: 'low_confidence')",
+        help="Remasking strategy ('low_confidence' or 'random')",
     )
     return parser
 
@@ -218,6 +214,8 @@ def main():
                 raise ValueError(
                     "--kv-group-size does not match the kv cache loaded from --prompt-cache-file."
                 )
+    else:
+        prompt_cache = None
 
     # Building tokenizer_config
     tokenizer_config = (
@@ -284,40 +282,24 @@ def main():
     else:
         draft_model = None
 
-    # Determine model type
-    model_type = getattr(model.args, "model_type", None)
+    # Build generation args, excluding core arguments passed explicitly
+    exclude_args = {"model", "tokenizer", "prompt", "verbose"}
+    generation_args = {k: v for k, v in vars(args).items() if k not in exclude_args}
+    if getattr(model.args, "model_type", None) != "llada":
+        generation_args["sampler"] = make_sampler(
+            args.temp, args.top_p, args.min_p, args.min_tokens_to_keep
+        )
+        generation_args["prompt_cache"] = prompt_cache
+        generation_args["draft_model"] = draft_model
 
-    # Prepare generation arguments based on model type
-    if model_type == "llada":
-        generation_args = {
-            "verbose": args.verbose,
-            "steps": args.steps,
-            "gen_length": args.gen_length,
-            "block_length": args.block_length,
-            "noise_temp": args.noise_temp,
-            "cfg": args.cfg,
-            "remasking": args.remasking,
-        }
-    else:
-        generation_args = {
-            "max_tokens": args.max_tokens,
-            "sampler": make_sampler(
-                args.temp, args.top_p, args.min_p, args.min_tokens_to_keep
-            ),
-            "verbose": args.verbose,
-            "max_kv_size": args.max_kv_size,
-            "prompt_cache": prompt_cache if using_cache else None,
-            "kv_bits": args.kv_bits,
-            "kv_group_size": args.kv_group_size,
-            "quantized_kv_start": args.quantized_kv_start,
-            "draft_model": draft_model,
-            "num_draft_tokens": args.num_draft_tokens,
-        }
-
-    # Generate response using the unified generate function
-    response = generate(model, tokenizer, prompt, **generation_args)
-
-    # Print the response if not verbose (verbose output is handled in generate)
+    # Generate and output
+    response = generate(
+        model,
+        tokenizer,
+        prompt,
+        verbose=args.verbose,
+        **generation_args,
+    )
     if not args.verbose:
         print(response)
 
