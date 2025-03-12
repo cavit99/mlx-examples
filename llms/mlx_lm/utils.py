@@ -210,7 +210,7 @@ def maybe_quantize_kv_cache(prompt_cache, quantized_kv_start, kv_group_size, kv_
                 )
 
 
-def diffusion_generate(
+def generate_diffusion(
     prompt: mx.array,
     model: nn.Module,
     tokenizer,
@@ -222,7 +222,7 @@ def diffusion_generate(
     cfg: float = 0.0,
     mask_token_id: int = None,
     verbose: bool = False,
-    diffusion_seed: Optional[int] = None,
+    seed: Optional[int] = None,
     remasking: str = "low_confidence",
 ) -> Tuple[mx.array, str]:
     """
@@ -239,7 +239,7 @@ def diffusion_generate(
         cfg (float): Classifier-free guidance scale.
         mask_token_id (int, optional): ID for [MASK] token.
         verbose (bool): Print debug information.
-        diffusion_seed (Optional[int]): Seed for diffusion process randomness.
+        seed (Optional[int]): Seed for diffusion process randomness.
         remasking (str): Remasking strategy, either 'low_confidence' or 'random'.
 
     Returns:
@@ -247,6 +247,7 @@ def diffusion_generate(
     """
 
     # Stabilized Gumbel noise base
+    @mx.compile
     def stabilized_gumbel(key, shape):
         uniform = mx.random.uniform(
             low=1e-7, high=1 - 1e-7, shape=shape, dtype=mx.float32, key=key
@@ -254,6 +255,7 @@ def diffusion_generate(
         return -mx.log(uniform)
 
     # Gumbel sampling in probability space
+    @mx.compile
     def gumbel_argmax(logits, temp, key):
         if temp <= 0.0:
             probs = mx.softmax(logits, axis=-1)
@@ -291,12 +293,11 @@ def diffusion_generate(
     x = mx.full((batch_size, seq_len), mask_token_id, dtype=prompt.dtype)
     x[:, :prompt_length] = prompt
     mask = mx.zeros((1, 1, seq_len, seq_len), dtype=x.dtype)
-    mx.eval(x)
 
     # PRNG setup
-    if diffusion_seed is None:
-        diffusion_seed = int(time.time_ns())
-    master_key = mx.random.key(diffusion_seed)
+    if seed is None:
+        seed = int(time.time_ns())
+    master_key = mx.random.key(seed)
     block_keys = mx.random.split(master_key, num_blocks)
 
     # Block processing
@@ -313,13 +314,15 @@ def diffusion_generate(
         prompt_mask = seq_indices < prompt_length
         block_mask, prompt_mask = block_mask[None, :], prompt_mask[None, :]
 
-        timesteps = mx.linspace(1.0, 0.0, block_steps)  # Include 0.0
+        timesteps = mx.linspace(1.0, 0.0, block_steps)
         step_keys = mx.random.split(block_keys[block_idx], block_steps)
 
         for step, t in enumerate(timesteps):
             mask_condition = x == mask_token_id
             block_mask_condition = mask_condition & block_mask
             num_masks_in_block = int(mx.sum(block_mask_condition).item())
+            mx.eval(block_mask_condition)
+
             if num_masks_in_block == 0:
                 if verbose:
                     print(
@@ -336,7 +339,6 @@ def diffusion_generate(
                 logits = un_logits + (cfg + 1) * (logits - un_logits)
             else:
                 logits = model(x, mask=mask)
-            mx.eval(logits)
 
             # Sampling
             step_key = step_keys[step]
@@ -361,8 +363,8 @@ def diffusion_generate(
 
             # Apply confidence scores only to masked tokens in the current block
             masked_confidences = mx.where(block_mask_condition, confidence_scores, -1e9)
-
             target_unmasked = int(mx.round(block_size * (1 - t)).item())
+            mx.eval(t)
             current_unmasked = block_size - num_masks_in_block
 
             # Force full unmasking on last step
@@ -382,9 +384,9 @@ def diffusion_generate(
                 unmask_mask = mx.zeros((batch_size, seq_len), dtype=mx.bool_)
                 unmask_mask[:, unmask_indices] = True
                 x = mx.where(unmask_mask & block_mask_condition, x0, x)
-                mx.eval(x)
 
             if verbose:
+                mx.eval(x)
                 response_tokens = x[0, prompt_length:block_end].tolist()
                 try:
                     current_text = tokenizer.decode(
@@ -406,6 +408,7 @@ def diffusion_generate(
                 except Exception as e:
                     print(f"Error displaying progress at step {step}: {e}")
 
+    mx.eval(x)
     final_text = tokenizer.decode(
         x[0, prompt_length:].tolist(), skip_special_tokens=True
     )
@@ -727,12 +730,12 @@ def stream_generate(
             "noise_temp": kwargs.pop("noise_temp", 0.0),
             "cfg": kwargs.pop("cfg", 0.0),
             "mask_token_id": kwargs.pop("mask_token_id", None),
-            "diffusion_seed": kwargs.pop("diffusion_seed", None),
+            "seed": kwargs.pop("seed", None),
             "verbose": kwargs.get("verbose", False),
         }
         with wired_limit(model, [generation_stream]):
             tic = time.perf_counter()
-            output_sequence, final_text = diffusion_generate(
+            output_sequence, final_text = generate_diffusion(
                 prompt, model, tokenizer, **diffusion_kwargs
             )
             prompt_time = time.perf_counter() - tic
@@ -819,7 +822,7 @@ def generate(
        verbose (bool): If ``True``, print tokens and timing information.
            Default: ``False``.
        kwargs: The remaining options get passed to :func:`stream_generate` or
-           :func:`diffusion_generate` depending on model type.
+           :func:`generate_diffusion` depending on model type.
            See those functions for more details.
     Returns:
         str: The generated text.
@@ -835,7 +838,7 @@ def generate(
     # Check if this is a diffusion model
     model_type = getattr(model.args, "model_type", None)
     if model_type == "llada":
-        # For diffusion models, handle prompt conversion and call diffusion_generate
+        # For diffusion models, handle prompt conversion and call generate_diffusion
         prompt_tensor = (
             mx.array(prompt)
             if isinstance(prompt, list)
@@ -850,7 +853,7 @@ def generate(
             "noise_temp",
             "cfg",
             "mask_token_id",
-            "diffusion_seed",
+            "seed",
             "verbose",
         ]
         # Filter diffusion-specific arguments
@@ -863,7 +866,7 @@ def generate(
         start_time = time.perf_counter()
 
         # Generate with diffusion
-        output_sequence, final_text = diffusion_generate(
+        output_sequence, final_text = generate_diffusion(
             prompt_tensor,
             model,
             tokenizer,
