@@ -291,8 +291,9 @@ def generate_diffusion(
                 break
 
             if cfg > 0.0:
-                un_x = mx.full((batch_size, seq_len), mask_token_id, dtype=x.dtype)
-                un_x[:, :prompt_length] = prompt
+                un_x = mx.full(
+                    (batch_size, seq_len), mask_token_id, dtype=x.dtype
+                )  # Fully masked
                 x_ = mx.concatenate([x, un_x], axis=0)
                 logits = model(x_, mask=full_mask).astype(model_dtype)
                 logits, un_logits = mx.split(logits, 2, axis=0)
