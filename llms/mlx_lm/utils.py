@@ -33,7 +33,6 @@ from transformers import PreTrainedTokenizer
 
 # Local imports
 from .models import cache
-from .sample_utils import make_logits_processors, make_sampler
 from .tokenizer_utils import TokenizerWrapper, load_tokenizer
 from .tuner.utils import dequantize as dequantize_model
 from .tuner.utils import load_adapters, nparams
@@ -220,32 +219,8 @@ def generate_diffusion(
     verbose: bool = False,
     remasking: str = "low_confidence",
 ) -> Generator[GenerationResponse, None, None]:
-    """
-    Generate text using a diffusion-based approach with stabilized Gumbel noise in probability space.
-
-    Args:
-        prompt (mx.array): Input prompt tensor.
-        model (nn.Module): LLaDA model.
-        tokenizer: Tokenizer instance.
-        steps (int): Total number of diffusion steps across all blocks.
-        gen_length (int): Length of generated sequence.
-        block_length (int, optional): Length of each block. If None, defaults to gen_length.
-        noise_temp (float): Temperature for Gumbel noise exponent, controlling randomness.
-        cfg (float): Classifier-free guidance scale.
-        mask_token_id (int, optional): ID for [MASK] token.
-        verbose (bool): If True, yield intermediate progress. Default: False.
-        remasking (str): Remasking strategy ("low_confidence" or "random").
-
-    Yields:
-        GenerationResponse: Intermediate progress when verbose=True, final result otherwise.
-    """
-
     @mx.compile
     def generate_stabilized_gumbel_noise(key, shape):
-        """
-        Generate stabilized Gumbel noise from a uniform distribution
-        with bounded values as base for diffusion
-        """
         uniform = mx.random.uniform(
             low=1e-7, high=1 - 1e-7, shape=shape, dtype=mx.float32, key=key
         )
@@ -253,31 +228,24 @@ def generate_diffusion(
 
     @mx.compile
     def sample_gumbel_or_softmax(logits, temp, key):
-        """
-        Sample token indices from logits using Gumbel noise or softmax
-        based on temperature in probably space"""
-        logits = logits - mx.max(logits, axis=-1, keepdims=True)  # Stabilize
+        logits = logits - mx.max(logits, axis=-1, keepdims=True)
         probs = mx.softmax(logits, axis=-1)
         gumbel_noise = generate_stabilized_gumbel_noise(key, logits.shape) ** temp
         noisy_probs = mx.where(temp > 0.0, probs / gumbel_noise, probs)
         sampled_ids = mx.argmax(noisy_probs, axis=-1)
         return sampled_ids, gumbel_noise
 
-    # Model dtype handling
     model_dtype = (
         mx.float16
         if hasattr(model, "dtype") and model.dtype == mx.float16
         else mx.float32
     )
-
-    # Default mask token ID
     mask_token_id = mask_token_id or getattr(model.args, "mask_token_id", 126336)
 
     batch_size = 1
     prompt_length = prompt.shape[0]
     seq_len = prompt_length + gen_length
 
-    # Block setup
     block_length = block_length or gen_length
     num_blocks = (gen_length + block_length - 1) // block_length
     block_sizes = [
@@ -291,17 +259,14 @@ def generate_diffusion(
 
     x = mx.full((batch_size, seq_len), mask_token_id, dtype=prompt.dtype)
     x[:, :prompt_length] = prompt
-    mask = mx.zeros((1, 1, seq_len, seq_len), dtype=mx.float16)
+    full_mask = mx.zeros((1, 1, seq_len, seq_len), dtype=mx.float16)
 
-    # Initialize random keys (try to inherit from wrapper)
     master_key = (
         mx.random.key(int(time.time_ns()))
         if mx.random.seed is None
         else mx.random.key(0)
     )
     block_keys = mx.random.split(master_key, num_blocks)
-
-    # Pre-allocate index_buffer
     max_unmask = max(block_sizes)
     index_buffer = mx.arange(max_unmask, dtype=mx.int32)
 
@@ -322,27 +287,23 @@ def generate_diffusion(
             block_mask_condition = mask_condition & block_mask
             num_masks_in_block = int(mx.sum(block_mask_condition).item())
 
-            # Early stopping logic if all unmasked
             if num_masks_in_block == 0:
                 break
 
-            # CFG (Classifier-free guidance) and logits
             if cfg > 0.0:
-                un_x = mx.full(x.shape, mask_token_id, dtype=x.dtype)
+                un_x = mx.full((batch_size, seq_len), mask_token_id, dtype=x.dtype)
                 un_x[:, :prompt_length] = prompt
-                x_ = mx.concatenate([x, un_x], axis=0)  # Shape: (2, seq_len)
-                logits = model(x_, mask=mask).astype(model_dtype)
+                x_ = mx.concatenate([x, un_x], axis=0)
+                logits = model(x_, mask=full_mask).astype(model_dtype)
                 logits, un_logits = mx.split(logits, 2, axis=0)
                 logits = un_logits + (cfg + 1) * (logits - un_logits)
             else:
-                logits = model(x, mask=mask).astype(model_dtype)
+                logits = model(x, mask=full_mask).astype(model_dtype)
 
-            # Sampling
             x0, gumbel_noise = sample_gumbel_or_softmax(
                 logits, noise_temp, step_keys[step]
             )
 
-            # Confidence scores
             if remasking == "low_confidence":
                 if noise_temp > 0.0:
                     confidence_scores = mx.max(
@@ -357,7 +318,6 @@ def generate_diffusion(
                     shape=(batch_size, seq_len), key=step_keys[step], dtype=model_dtype
                 )
 
-            # Unmasking
             masked_confidences = mx.where(block_mask_condition, confidence_scores, -1e9)
             target_unmasked = int(mx.round(block_size * (1 - t)).item())
             current_unmasked = block_size - num_masks_in_block
@@ -368,11 +328,15 @@ def generate_diffusion(
             )
 
             if num_to_unmask > 0:
-                unmask_indices = mx.take(
-                    mx.argsort(masked_confidences.flatten())[::-1],
-                    index_buffer[:num_to_unmask],
-                )
+                sorted_indices = mx.argsort(masked_confidences.flatten())[::-1]
+                unmask_indices = mx.take(sorted_indices, index_buffer[:num_to_unmask])
                 x[:, unmask_indices] = x0[:, unmask_indices]
+
+            # Recalculate masks after unmasking
+            mask_condition = x == mask_token_id
+            block_mask_condition = mask_condition & block_mask
+            num_masks_in_block = int(mx.sum(block_mask_condition).item())
+            unmasked_count = block_size - num_masks_in_block
 
             if verbose:
                 mx.eval(x)
@@ -381,46 +345,60 @@ def generate_diffusion(
                     tokenizer.decode(response_tokens, skip_special_tokens=True).strip()
                     or "(No text revealed yet)"
                 )
-                unmasked_count = block_size - response_tokens.count(mask_token_id)
+                elapsed_time = time.perf_counter() - tic
                 yield GenerationResponse(
-                    text=f"\033[2J\033[H{'=' * 10}\nGenerating with diffusion model: {steps} steps, {gen_length} tokens\n"
+                    text=f"\033[2J\033[H{'=' * 10}\n"
+                    f"Generating with diffusion model: {steps} steps, {gen_length} tokens\n"
                     f"Block {block_idx + 1}/{num_blocks} | Step {step + 1}/{block_steps} | "
                     f"Unmasked {unmasked_count}/{block_size}\n\n{current_text}",
                     token=0,
                     logprobs=mx.array([]),
                     prompt_tokens=prompt.size,
-                    prompt_tps=prompt.size / (time.perf_counter() - tic) if tic else 0,
+                    prompt_tps=prompt.size / elapsed_time if elapsed_time > 0 else 0,
                     generation_tokens=block_end - prompt_length,
                     generation_tps=(
-                        (block_end - prompt_length) / (time.perf_counter() - tic)
-                        if tic
+                        (block_end - prompt_length) / elapsed_time
+                        if elapsed_time > 0
                         else 0
                     ),
                     peak_memory=mx.metal.get_peak_memory() / 1e9,
                     finish_reason=None,
                 )
 
-    # Final response after all blocks are complete
+        mx.eval(x)  # Finalize block
+
     mx.eval(x)
     final_text = tokenizer.decode(
         x[0, prompt_length:].tolist(), skip_special_tokens=True
     ).strip()
     prompt_time = time.perf_counter() - tic
-    generation_tokens = x.shape[1] - prompt.size
-    final_response = GenerationResponse(
-        text=(
-            final_text if not verbose else ""
-        ),  # Empty text in verbose mode to avoid duplication
-        token=0,
-        logprobs=mx.array([]),
-        prompt_tokens=prompt.size,
-        prompt_tps=prompt.size / prompt_time if prompt_time > 0 else 0,
-        generation_tokens=generation_tokens,
-        generation_tps=generation_tokens / prompt_time if prompt_time > 0 else 0,
-        peak_memory=mx.metal.get_peak_memory() / 1e9,
-        finish_reason="length",
-    )
-    yield final_response
+    generation_tokens = seq_len - prompt_length
+
+    if not verbose:
+        yield GenerationResponse(
+            text=final_text,
+            token=0,
+            logprobs=mx.array([]),
+            prompt_tokens=prompt.size,
+            prompt_tps=prompt.size / prompt_time if prompt_time > 0 else 0,
+            generation_tokens=generation_tokens,
+            generation_tps=generation_tokens / prompt_time if prompt_time > 0 else 0,
+            peak_memory=mx.metal.get_peak_memory() / 1e9,
+            finish_reason="length",
+        )
+    # In verbose mode, output a final response with finish_reason set
+    elif verbose:
+        yield GenerationResponse(
+            text="",
+            token=0,
+            logprobs=mx.array([]),
+            prompt_tokens=prompt.size,
+            prompt_tps=prompt.size / prompt_time if prompt_time > 0 else 0,
+            generation_tokens=generation_tokens,
+            generation_tps=generation_tokens / prompt_time if prompt_time > 0 else 0,
+            peak_memory=mx.metal.get_peak_memory() / 1e9,
+            finish_reason="length",
+        )
 
 
 def generate_step(
