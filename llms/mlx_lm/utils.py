@@ -132,10 +132,6 @@ def _get_classes(config: dict):
     model_type = config["model_type"]
     model_type = MODEL_REMAPPING.get(model_type, model_type)
     try:
-        if model_type == "llada":
-            from .models import llada
-
-            return llada.LLaDAModelLM, llada.ModelArgs
         arch = importlib.import_module(f"mlx_lm.models.{model_type}")
     except ImportError:
         msg = f"Model type {model_type} not supported."
@@ -222,9 +218,8 @@ def generate_diffusion(
     cfg: float = 0.0,
     mask_token_id: int = None,
     verbose: bool = False,
-    seed: Optional[int] = None,
     remasking: str = "low_confidence",
-) -> Tuple[mx.array, str]:
+) -> Generator[GenerationResponse, None, None]:
     """
     Generate text using a diffusion-based approach with stabilized Gumbel noise in probability space.
 
@@ -238,12 +233,11 @@ def generate_diffusion(
         noise_temp (float): Temperature for Gumbel noise exponent, controlling randomness.
         cfg (float): Classifier-free guidance scale.
         mask_token_id (int, optional): ID for [MASK] token.
-        verbose (bool): Print debug information.
-        seed (Optional[int]): Seed for diffusion process randomness.
-        remasking (str): Remasking strategy, either 'low_confidence' or 'random'.
+        verbose (bool): If True, yield intermediate progress. Default: False.
+        remasking (str): Remasking strategy ("low_confidence" or "random").
 
-    Returns:
-        Tuple[mx.array, str]: Generated token sequence and decoded text.
+    Yields:
+        GenerationResponse: Intermediate progress when verbose=True, final result otherwise.
     """
 
     @mx.compile
@@ -278,6 +272,7 @@ def generate_diffusion(
 
     # Default mask token ID
     mask_token_id = mask_token_id or getattr(model.args, "mask_token_id", 126336)
+
     batch_size = 1
     prompt_length = prompt.shape[0]
     seq_len = prompt_length + gen_length
@@ -294,35 +289,26 @@ def generate_diffusion(
         base_steps + 1 if i < remainder else base_steps for i in range(num_blocks)
     ]
 
-    if verbose:
-        print(
-            f"Steps: {steps}, Gen Length: {gen_length}, Blocks: {block_sizes}, Steps per Block: {steps_per_block}"
-        )
-
-    # Initialize sequence
     x = mx.full((batch_size, seq_len), mask_token_id, dtype=prompt.dtype)
     x[:, :prompt_length] = prompt
-    mask = mx.zeros(
-        (1, 1, seq_len, seq_len), dtype=mx.float16
-    )  # Fixed: Use float16 for mask
+    mask = mx.zeros((1, 1, seq_len, seq_len), dtype=mx.float16)
 
-    # PRNG setup
-    if seed is None:
-        seed = int(time.time_ns())
-    master_key = mx.random.key(seed)
+    # Initialize random keys (try to inherit from wrapper)
+    master_key = (
+        mx.random.key(int(time.time_ns()))
+        if mx.random.seed is None
+        else mx.random.key(0)
+    )
     block_keys = mx.random.split(master_key, num_blocks)
 
-    # Pre-allocate index_buffer (NEW)
+    # Pre-allocate index_buffer
     max_unmask = max(block_sizes)
     index_buffer = mx.arange(max_unmask, dtype=mx.int32)
 
-    # Block processing
+    tic = time.perf_counter()
     for block_idx, (block_size, block_steps) in enumerate(
         zip(block_sizes, steps_per_block)
     ):
-        if verbose and block_idx > 0:
-            print(f"\n--- Block {block_idx + 1}/{num_blocks} ---")
-
         block_start = prompt_length + sum(block_sizes[:block_idx])
         block_end = block_start + block_size
         seq_indices = mx.arange(seq_len, dtype=mx.int32)
@@ -336,11 +322,8 @@ def generate_diffusion(
             block_mask_condition = mask_condition & block_mask
             num_masks_in_block = int(mx.sum(block_mask_condition).item())
 
+            # Early stopping logic if all unmasked
             if num_masks_in_block == 0:
-                if verbose:
-                    print(
-                        f"Block {block_idx + 1} fully unmasked at step {step + 1}/{block_steps}"
-                    )
                 break
 
             # CFG (Classifier-free guidance) and logits
@@ -394,35 +377,50 @@ def generate_diffusion(
             if verbose:
                 mx.eval(x)
                 response_tokens = x[0, prompt_length:block_end].tolist()
-                try:
-                    current_text = tokenizer.decode(
-                        response_tokens, skip_special_tokens=True
-                    )
-                    mask_count = response_tokens.count(mask_token_id)
-                    total_tokens = len(response_tokens)
-                    unmasked_count = total_tokens - mask_count
-                    output_line = current_text.strip() or "(No text revealed yet)"
-                    print("\033[2J\033[H", end="", flush=True)
-                    print(
-                        f"Generating with diffusion model: {steps} steps, {gen_length} tokens\n"
-                    )
-                    print(
-                        f"Block {block_idx + 1}/{num_blocks} | Step {step + 1}/{block_steps} | Unmasked {unmasked_count}/{total_tokens}\n"
-                    )
-                    print(output_line)
-                except Exception as e:
-                    print("\033[2J\033[H", end="", flush=True)
-                    print(f"Error displaying progress at step {step}: {e}")
+                current_text = (
+                    tokenizer.decode(response_tokens, skip_special_tokens=True).strip()
+                    or "(No text revealed yet)"
+                )
+                unmasked_count = block_size - response_tokens.count(mask_token_id)
+                yield GenerationResponse(
+                    text=f"\033[2J\033[H{'=' * 10}\nGenerating with diffusion model: {steps} steps, {gen_length} tokens\n"
+                    f"Block {block_idx + 1}/{num_blocks} | Step {step + 1}/{block_steps} | "
+                    f"Unmasked {unmasked_count}/{block_size}\n\n{current_text}",
+                    token=0,
+                    logprobs=mx.array([]),
+                    prompt_tokens=prompt.size,
+                    prompt_tps=prompt.size / (time.perf_counter() - tic) if tic else 0,
+                    generation_tokens=block_end - prompt_length,
+                    generation_tps=(
+                        (block_end - prompt_length) / (time.perf_counter() - tic)
+                        if tic
+                        else 0
+                    ),
+                    peak_memory=mx.metal.get_peak_memory() / 1e9,
+                    finish_reason=None,
+                )
 
-        if verbose and num_masks_in_block > 0:
-            print()
-
-    # Final evaluation and output
+    # Final response after all blocks are complete
     mx.eval(x)
     final_text = tokenizer.decode(
         x[0, prompt_length:].tolist(), skip_special_tokens=True
+    ).strip()
+    prompt_time = time.perf_counter() - tic
+    generation_tokens = x.shape[1] - prompt.size
+    final_response = GenerationResponse(
+        text=(
+            final_text if not verbose else ""
+        ),  # Empty text in verbose mode to avoid duplication
+        token=0,
+        logprobs=mx.array([]),
+        prompt_tokens=prompt.size,
+        prompt_tps=prompt.size / prompt_time if prompt_time > 0 else 0,
+        generation_tokens=generation_tokens,
+        generation_tps=generation_tokens / prompt_time if prompt_time > 0 else 0,
+        peak_memory=mx.metal.get_peak_memory() / 1e9,
+        finish_reason="length",
     )
-    return x, final_text
+    yield final_response
 
 
 def generate_step(
@@ -694,11 +692,38 @@ def speculative_generate_step(
         _rewind_cache(num_draft, n)
 
 
+# Define valid argument sets for clarity and filtering
+AUTOREGRESSIVE_ARGS = {
+    "max_tokens",
+    "sampler",
+    "logits_processors",
+    "max_kv_size",
+    "prompt_cache",
+    "prefill_step_size",
+    "kv_bits",
+    "kv_group_size",
+    "quantized_kv_start",
+    "prompt_progress_callback",
+    "num_draft_tokens",
+    "draft_model",
+}
+DIFFUSION_ARGS = {
+    "steps",
+    "gen_length",
+    "block_length",
+    "noise_temp",
+    "cfg",
+    "mask_token_id",
+    "remasking",
+}
+
+
 def stream_generate(
     model: nn.Module,
     tokenizer: Union[PreTrainedTokenizer, TokenizerWrapper],
     prompt: Union[str, mx.array, List[int]],
     draft_model: Optional[nn.Module] = None,
+    verbose: bool = False,  # Added explicitly for diffusion
     **kwargs,
 ) -> Generator[GenerationResponse, None, None]:
     """
@@ -712,8 +737,8 @@ def stream_generate(
         draft_model (Optional[nn.Module]): An optional draft model. If provided
           then speculative decoding is used. The draft model must use the same
           tokenizer as the main model. Default: ``None``.
-        kwargs: The remaining options get passed to :func:`generate_step`.
-          See :func:`generate_step` for more details.
+        **kwargs: Options for generation. For autoregressive models,
+            See:func:`generate_step` or for diffusion model func:`generate_diffusion`.
 
     Yields:
         GenerationResponse: An instance containing the generated text segment and
@@ -733,27 +758,61 @@ def stream_generate(
 
     detokenizer = tokenizer.detokenizer
 
-    if draft_model is None:
-        kwargs.pop("num_draft_tokens", None)
-        token_generator = generate_step(prompt, model, **kwargs)
-    else:
-        kwargs.pop("max_kv_size", None)
-        token_generator = speculative_generate_step(
-            prompt, model, draft_model, **kwargs
-        )
+    # Fork between diffusion and autoregressive models
+    is_diffusion = getattr(model.args, "model_type", None) == "llada"
     with wired_limit(model, [generation_stream]):
-        detokenizer.reset()
-        tic = time.perf_counter()
-        for n, (token, logprobs) in enumerate(token_generator):
-            if n == 0:
-                prompt_time = time.perf_counter() - tic
-                prompt_tps = prompt.size / prompt_time
-                tic = time.perf_counter()
-            if token in tokenizer.eos_token_ids:
-                break
+        if is_diffusion:
+            diffusion_args = {k: kwargs.get(k) for k in DIFFUSION_ARGS if k in kwargs}
+            diffusion_args["verbose"] = verbose
+            diffusion_gen = generate_diffusion(
+                prompt, model, tokenizer, **diffusion_args
+            )
+            if verbose:
+                for response in diffusion_gen:
+                    yield response
+            else:
+                final_response = None
+                for final_response in diffusion_gen:
+                    pass
+                yield final_response
+        else:
+            # Autoregressive path
+            autoregressive_args = {
+                k: kwargs.get(k) for k in AUTOREGRESSIVE_ARGS if k in kwargs
+            }
+            if draft_model is None:
+                autoregressive_args.pop("num_draft_tokens", None)
+                token_generator = generate_step(prompt, model, **autoregressive_args)
+            else:
+                autoregressive_args.pop("max_kv_size", None)
+                token_generator = speculative_generate_step(
+                    prompt, model, draft_model, **autoregressive_args
+                )
 
-            detokenizer.add_token(token)
+            detokenizer.reset()
+            tic = time.perf_counter()
+            for n, (token, logprobs) in enumerate(token_generator):
+                if n == 0:
+                    prompt_time = time.perf_counter() - tic
+                    prompt_tps = prompt.size / prompt_time
+                    tic = time.perf_counter()
+                if token in tokenizer.eos_token_ids:
+                    break
 
+                detokenizer.add_token(token)
+                yield GenerationResponse(
+                    text=detokenizer.last_segment,
+                    token=token,
+                    logprobs=logprobs,
+                    prompt_tokens=prompt.size,
+                    prompt_tps=prompt_tps,
+                    generation_tokens=n + 1,
+                    generation_tps=(n + 1) / (time.perf_counter() - tic),
+                    peak_memory=mx.metal.get_peak_memory() / 1e9,
+                    finish_reason=None,
+                )
+
+            detokenizer.finalize()
             yield GenerationResponse(
                 text=detokenizer.last_segment,
                 token=token,
@@ -763,21 +822,8 @@ def stream_generate(
                 generation_tokens=n + 1,
                 generation_tps=(n + 1) / (time.perf_counter() - tic),
                 peak_memory=mx.metal.get_peak_memory() / 1e9,
-                finish_reason=None,
+                finish_reason="stop" if token in tokenizer.eos_token_ids else "length",
             )
-
-        detokenizer.finalize()
-        yield GenerationResponse(
-            text=detokenizer.last_segment,
-            token=token,
-            logprobs=logprobs,
-            prompt_tokens=prompt.size,
-            prompt_tps=prompt_tps,
-            generation_tokens=n + 1,
-            generation_tps=(n + 1) / (time.perf_counter() - tic),
-            peak_memory=mx.metal.get_peak_memory() / 1e9,
-            finish_reason="stop" if token in tokenizer.eos_token_ids else "length",
-        )
 
 
 def generate(
@@ -785,6 +831,7 @@ def generate(
     tokenizer: Union[PreTrainedTokenizer, TokenizerWrapper],
     prompt: Union[str, List[int]],
     verbose: bool = False,
+    formatter: Optional[Callable] = None,
     **kwargs,
 ) -> str:
     """
@@ -794,80 +841,46 @@ def generate(
         model (nn.Module): The language model.
         tokenizer (PreTrainedTokenizer): The tokenizer.
         prompt (Union[str, List[int]]): The input prompt string or integer tokens.
-        verbose (bool): If True, print tokens and timing info. Default: False.
-        kwargs: Options for generation. Common: seed.
-            Autoregressive: max_tokens, sampler, draft_model, etc.
-            Diffusion: steps, gen_length, noise_temp, etc.
+        verbose (bool): If ``True``, print tokens and timing information.
+            Default: ``False``.
+        formatter (Optional[Callable]): Deprecated text formatter. Default: ``None``.
+        **kwargs: Options passed to :func:`stream_generate`. See :func:`stream_generate`
+            for details.
+
     Returns:
         str: The generated text.
     """
-    if "formatter" in kwargs:
-        print("[Warning] Text formatting is deprecated and no longer used.")
-        del kwargs["formatter"]
-
+    if formatter is not None:
+        print(
+            "[Warning] Text formatting is deprecated and no longer used. "
+            "The argument will be removed in a future version."
+        )
     if verbose:
         print("=" * 10)
 
-    # Prepare prompt
-    if not isinstance(tokenizer, TokenizerWrapper):
-        tokenizer = TokenizerWrapper(tokenizer)
-    if not isinstance(prompt, mx.array):
-        if isinstance(prompt, str):
-            add_special_tokens = tokenizer.bos_token is None or not prompt.startswith(
-                tokenizer.bos_token
-            )
-            prompt = tokenizer.encode(prompt, add_special_tokens=add_special_tokens)
-        prompt = mx.array(prompt)
+    text = ""
+    for response in stream_generate(
+        model, tokenizer, prompt, verbose=verbose, **kwargs
+    ):
+        if verbose:
+            print(response.text, end="", flush=True)
+        text += response.text
 
-    # Timing setup
-    start_time = time.perf_counter()
-    model_type = getattr(model.args, "model_type", None)
-
-    if model_type == "llada":
-        # Filter kwargs for generate_diffusion
-        diffusion_args = {
-            k: kwargs[k]
-            for k in [
-                "steps",
-                "gen_length",
-                "block_length",
-                "noise_temp",
-                "cfg",
-                "mask_token_id",
-                "verbose",
-                "seed",
-                "remasking",
-            ]
-            if k in kwargs
-        }
-        diffusion_args["verbose"] = verbose  # Ensure verbose is set
-        output_sequence, text = generate_diffusion(
-            prompt, model, tokenizer, **diffusion_args
-        )
-        generation_tokens = output_sequence.shape[1] - prompt.size
-    else:
-        # Autoregressive generation
-        text = ""
-        for response in stream_generate(model, tokenizer, prompt, **kwargs):
-            if verbose:
-                print(response.text, end="", flush=True)
-            text += response.text
-        generation_tokens = response.generation_tokens if text else 0
-
-    # Unified metrics
-    generation_time = time.perf_counter() - start_time
-    if verbose and text:
+    if verbose:
+        print()
         print("\n" + "=" * 10)
-        print(f"Prompt: {prompt.size} tokens")
+        if not text:
+            print("No text generated for this prompt")
+            return
         print(
-            f"Generation: {generation_tokens} tokens, "
-            f"{generation_tokens / generation_time:.3f} tokens-per-sec"
+            f"Prompt: {response.prompt_tokens} tokens, "
+            f"{response.prompt_tps:.3f} tokens-per-sec"
         )
-        print(f"Peak memory: {mx.metal.get_peak_memory() / 1e9:.3f} GB")
-    elif verbose and not text:
-        print("\n" + "=" * 10)
-        print("No text generated for this prompt")
-
+        print(
+            f"Generation: {response.generation_tokens} tokens, "
+            f"{response.generation_tps:.3f} tokens-per-sec"
+        )
+        print(f"Peak memory: {response.peak_memory:.3f} GB")
     return text
 
 

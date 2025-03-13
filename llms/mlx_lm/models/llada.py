@@ -189,7 +189,9 @@ class LLaDAModel(nn.Module):
         return self.lm_head(h)
 
 
-class LLaDAModelLM(nn.Module):
+class Model(nn.Module):
+    """Top-level LLaDA model for diffusion-based text generation."""
+
     def __init__(self, args: ModelArgs):
         """Initialize the LLaDA model wrapper.
 
