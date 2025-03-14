@@ -217,7 +217,7 @@ def generate_diffusion(
     cfg: float = 0.0,
     mask_token_id: int = None,
     verbose: bool = False,
-    remasking: str = "low_confidence",
+    remasking: str = "high_confidence",
 ) -> Generator[GenerationResponse, None, None]:
 
     @mx.compile
@@ -307,9 +307,12 @@ def generate_diffusion(
 
             # CFG (Classifier-free guidance) and logits
             if cfg > 0.0:
-                un_x = mx.full(
-                    (batch_size, seq_len), mask_token_id, dtype=x.dtype
-                )  # Fully masked
+                # Create unconditional input by masking only the prompt portion
+                un_x = mx.where(
+                    mx.arange(seq_len, dtype=mx.int32) < prompt_length,
+                    mx.full((batch_size, seq_len), mask_token_id, dtype=x.dtype),
+                    x,
+                )
                 x_ = mx.concatenate([x, un_x], axis=0)
                 logits = model(x_, mask=full_mask).astype(model_dtype)
                 logits, un_logits = mx.split(logits, 2, axis=0)
@@ -323,7 +326,7 @@ def generate_diffusion(
             )
 
             # Remasking logic
-            if remasking == "low_confidence":
+            if remasking == "high_confidence":
                 if noise_temp > 0.0:
                     confidence_scores = mx.max(
                         mx.exp(logits - mx.max(logits, axis=-1, keepdims=True))
@@ -332,6 +335,7 @@ def generate_diffusion(
                     )
                 else:
                     confidence_scores = mx.max(mx.softmax(logits, axis=-1), axis=-1)
+
             elif remasking == "random":
                 confidence_scores = mx.random.uniform(
                     shape=(batch_size, seq_len), key=step_keys[step], dtype=model_dtype

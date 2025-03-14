@@ -24,7 +24,7 @@ DEFAULT_STEPS = 32
 DEFAULT_GEN_LENGTH = 64
 DEFAULT_NOISE_TEMP = 0.0
 DEFAULT_CFG = 0.0
-DEFAULT_REMASKING = "low_confidence"
+DEFAULT_REMASKING = "high_confidence"
 DEFAULT_BLOCK_LENGTH = None
 
 
@@ -186,7 +186,7 @@ def setup_arg_parser():
         "--remasking",
         type=str,
         default=DEFAULT_REMASKING,
-        help="Remasking strategy ('low_confidence' or 'random')",
+        help="Remasking strategy ('high_confidence', 'low_confidence', or 'random')",
     )
     return parser
 
