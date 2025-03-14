@@ -219,8 +219,13 @@ def generate_diffusion(
     verbose: bool = False,
     remasking: str = "low_confidence",
 ) -> Generator[GenerationResponse, None, None]:
+
     @mx.compile
     def generate_stabilized_gumbel_noise(key, shape):
+        """
+        Generate stabilized Gumbel noise from a uniform distribution
+        with bounded values as base for diffusion
+        """
         uniform = mx.random.uniform(
             low=1e-7, high=1 - 1e-7, shape=shape, dtype=mx.float32, key=key
         )
@@ -228,6 +233,9 @@ def generate_diffusion(
 
     @mx.compile
     def sample_gumbel_or_softmax(logits, temp, key):
+        """
+        Sample token indices from logits using Gumbel noise or softmax
+        based on temperature in probably space"""
         logits = logits - mx.max(logits, axis=-1, keepdims=True)
         probs = mx.softmax(logits, axis=-1)
         gumbel_noise = generate_stabilized_gumbel_noise(key, logits.shape) ** temp
@@ -235,17 +243,21 @@ def generate_diffusion(
         sampled_ids = mx.argmax(noisy_probs, axis=-1)
         return sampled_ids, gumbel_noise
 
+    # Model dtype handling
     model_dtype = (
         mx.float16
         if hasattr(model, "dtype") and model.dtype == mx.float16
         else mx.float32
     )
+
+    # Default mask token ID
     mask_token_id = mask_token_id or getattr(model.args, "mask_token_id", 126336)
 
     batch_size = 1
     prompt_length = prompt.shape[0]
     seq_len = prompt_length + gen_length
 
+    # Block setup
     block_length = block_length or gen_length
     num_blocks = (gen_length + block_length - 1) // block_length
     block_sizes = [
@@ -261,12 +273,14 @@ def generate_diffusion(
     x[:, :prompt_length] = prompt
     full_mask = mx.zeros((1, 1, seq_len, seq_len), dtype=mx.float16)
 
+    # Initialize random keys (try to inherit from wrapper)m
     master_key = (
         mx.random.key(int(time.time_ns()))
         if mx.random.seed is None
         else mx.random.key(0)
     )
     block_keys = mx.random.split(master_key, num_blocks)
+    # Pre-allocate index_buffer
     max_unmask = max(block_sizes)
     index_buffer = mx.arange(max_unmask, dtype=mx.int32)
 
@@ -287,9 +301,11 @@ def generate_diffusion(
             block_mask_condition = mask_condition & block_mask
             num_masks_in_block = int(mx.sum(block_mask_condition).item())
 
+            # Early stopping logic if all unmasked
             if num_masks_in_block == 0:
                 break
 
+            # CFG (Classifier-free guidance) and logits
             if cfg > 0.0:
                 un_x = mx.full(
                     (batch_size, seq_len), mask_token_id, dtype=x.dtype
@@ -301,10 +317,12 @@ def generate_diffusion(
             else:
                 logits = model(x, mask=full_mask).astype(model_dtype)
 
+            # Sampling
             x0, gumbel_noise = sample_gumbel_or_softmax(
                 logits, noise_temp, step_keys[step]
             )
 
+            # Remasking logic
             if remasking == "low_confidence":
                 if noise_temp > 0.0:
                     confidence_scores = mx.max(
@@ -319,6 +337,7 @@ def generate_diffusion(
                     shape=(batch_size, seq_len), key=step_keys[step], dtype=model_dtype
                 )
 
+            # Unmasking logic
             masked_confidences = mx.where(block_mask_condition, confidence_scores, -1e9)
             target_unmasked = int(mx.round(block_size * (1 - t)).item())
             current_unmasked = block_size - num_masks_in_block
@@ -368,6 +387,7 @@ def generate_diffusion(
 
         mx.eval(x)  # Finalize block
 
+    # Final response after all blocks are complete
     mx.eval(x)
     final_text = tokenizer.decode(
         x[0, prompt_length:].tolist(), skip_special_tokens=True
