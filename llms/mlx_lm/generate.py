@@ -24,7 +24,7 @@ DEFAULT_STEPS = 32
 DEFAULT_GEN_LENGTH = 64
 DEFAULT_NOISE_TEMP = 0.0
 DEFAULT_CFG = 0.0
-DEFAULT_REMASKING = "high_confidence"
+DEFAULT_UNMASKING = "topk"
 DEFAULT_BLOCK_LENGTH = None
 
 
@@ -183,10 +183,10 @@ def setup_arg_parser():
         help="Length of semi-autoregressive blocks for diffusion",
     )
     parser.add_argument(
-        "--remasking",
+        "--unmasking",
         type=str,
-        default=DEFAULT_REMASKING,
-        help="Remasking strategy ('high_confidence', 'low_confidence', or 'random')",
+        default=DEFAULT_UNMASKING,
+        help="Unmasking strategy ('topk' or 'random')",
     )
     return parser
 

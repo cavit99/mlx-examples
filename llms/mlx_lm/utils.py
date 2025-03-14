@@ -217,11 +217,11 @@ def generate_diffusion(
     cfg: float = 0.0,
     mask_token_id: int = None,
     verbose: bool = False,
-    remasking: str = "high_confidence",
+    unmasking: str = "topk",
 ) -> Generator[GenerationResponse, None, None]:
 
     @mx.compile
-    def generate_stabilized_gumbel_noise(key, shape):
+    def create_gumbel_noise(key, shape):
         """
         Generate stabilized Gumbel noise from a uniform distribution
         with bounded values as base for diffusion
@@ -229,16 +229,17 @@ def generate_diffusion(
         uniform = mx.random.uniform(
             low=1e-7, high=1 - 1e-7, shape=shape, dtype=mx.float32, key=key
         )
-        return -mx.log(uniform)
+
+        return -mx.log(-mx.log(uniform))
 
     @mx.compile
-    def sample_gumbel_or_softmax(logits, temp, key):
+    def sample_noise_or_greedy(logits, temp, key):
         """
         Sample token indices from logits using Gumbel noise or softmax
         based on temperature in probably space"""
         logits = logits - mx.max(logits, axis=-1, keepdims=True)
         probs = mx.softmax(logits, axis=-1)
-        gumbel_noise = generate_stabilized_gumbel_noise(key, logits.shape) ** temp
+        gumbel_noise = create_gumbel_noise(key, logits.shape) ** temp
         noisy_probs = mx.where(temp > 0.0, probs / gumbel_noise, probs)
         sampled_ids = mx.argmax(noisy_probs, axis=-1)
         return sampled_ids, gumbel_noise
@@ -321,12 +322,12 @@ def generate_diffusion(
                 logits = model(x, mask=full_mask).astype(model_dtype)
 
             # Sampling
-            x0, gumbel_noise = sample_gumbel_or_softmax(
+            x0, gumbel_noise = sample_noise_or_greedy(
                 logits, noise_temp, step_keys[step]
             )
 
-            # Remasking logic
-            if remasking == "high_confidence":
+            # unmasking logic
+            if unmasking == "topk":
                 if noise_temp > 0.0:
                     confidence_scores = mx.max(
                         mx.exp(logits - mx.max(logits, axis=-1, keepdims=True))
@@ -336,12 +337,15 @@ def generate_diffusion(
                 else:
                     confidence_scores = mx.max(mx.softmax(logits, axis=-1), axis=-1)
 
-            elif remasking == "random":
+            elif unmasking == "random":
                 confidence_scores = mx.random.uniform(
                     shape=(batch_size, seq_len), key=step_keys[step], dtype=model_dtype
                 )
+            else:
+                raise ValueError(
+                    f"Invalid unmasking strategy: {unmasking}, must be one of 'topk', or 'random'"
+                )
 
-            # Unmasking logic
             masked_confidences = mx.where(block_mask_condition, confidence_scores, -1e9)
             target_unmasked = int(mx.round(block_size * (1 - t)).item())
             current_unmasked = block_size - num_masks_in_block
@@ -717,7 +721,7 @@ DIFFUSION_ARGS = {
     "noise_temp",
     "cfg",
     "mask_token_id",
-    "remasking",
+    "unmasking",
 }
 
 
