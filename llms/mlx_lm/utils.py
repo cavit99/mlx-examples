@@ -219,6 +219,22 @@ def generate_diffusion(
     verbose: bool = False,
     unmasking: str = "topk",
 ) -> Generator[GenerationResponse, None, None]:
+    """
+    Generate text using a diffusion-based approach.
+
+    Args:
+        prompt: mx.array, tokenized input prompt of shape (prompt_length,)
+        model: nn.Module, Transformer-based mask predictor
+        tokenizer: tokenizer object with decode method
+        steps: int, total number of diffusion steps
+        gen_length: int, length of the generated sequence
+        block_length: int, size of each block (defaults to gen_length)
+        noise_temp: float, temperature for Gumbel noise sampling
+        cfg: float, classifier-free guidance scale
+        mask_token_id: int, token ID for masking (defaults to model-specific or 126336)
+        verbose: bool, whether to yield intermediate responses
+        unmasking: str, strategy for selecting tokens to unmask ('topk' or 'random')
+    """
 
     @mx.compile
     def create_gumbel_noise(key, shape):
@@ -234,9 +250,7 @@ def generate_diffusion(
 
     @mx.compile
     def sample_noise_or_greedy(logits, temp, key):
-        """
-        Sample token indices from logits using Gumbel noise or softmax
-        based on temperature in probably space"""
+        """Sample token indices from logits using Gumbel noise or softmax based on temperature"""
         logits = logits - mx.max(logits, axis=-1, keepdims=True)
         probs = mx.softmax(logits, axis=-1)
         gumbel_noise = create_gumbel_noise(key, logits.shape) ** temp
